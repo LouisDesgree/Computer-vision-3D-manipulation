@@ -107,10 +107,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-detection-confidence", type=float, default=0.5)
     parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
     parser.add_argument("--trail-length", type=int, default=32)
-    parser.add_argument("--sensitivity", type=float, default=0.25)
-    parser.add_argument("--rotation-smoothing", type=float, default=0.12)
-    parser.add_argument("--anchor-smoothing", type=float, default=0.1)
-    parser.add_argument("--max-anchor-step", type=float, default=28.0)
+    parser.add_argument("--sensitivity", type=float, default=0.32)
+    parser.add_argument("--rotation-smoothing", type=float, default=0.18)
+    parser.add_argument("--anchor-smoothing", type=float, default=0.14)
+    parser.add_argument("--max-anchor-step", type=float, default=40.0)
     parser.add_argument("--cube-size", type=float, default=0.6)
     parser.add_argument("--cube-distance", type=float, default=5.8)
     parser.add_argument(
@@ -245,11 +245,10 @@ def _draw_cube(
         pts = [projected[idx] for idx in face_indices]
         cv2.fillConvexPoly(frame, _to_poly(pts), shade)
 
-    edge_color = (30, 30, 30)
     if highlight:
         edge_color = (0, 220, 255)
-    for start, end in EDGES:
-        cv2.line(frame, projected[start], projected[end], edge_color, 2)
+        for start, end in EDGES:
+            cv2.line(frame, projected[start], projected[end], edge_color, 2)
 
 
 def _cube_bounds(projected: list[Tuple[int, int]]) -> Tuple[int, int, int, int]:
@@ -333,6 +332,7 @@ def main() -> None:
             hand_results = None
             tip = None
             pinch = False
+            palm_center = None
             if results:
                 hand_results = results
                 hand = results[0]
@@ -341,7 +341,7 @@ def main() -> None:
                 dx = tip[0] - thumb_tip[0]
                 dy = tip[1] - thumb_tip[1]
                 pinch_distance = math.hypot(dx, dy)
-                pinch_threshold = max(25.0, width * 0.04)
+                pinch_threshold = max(30.0, width * 0.05)
                 pinch = pinch_distance < pinch_threshold
                 state.trail.append(tip)
                 state.last_hand_time = time.time()
@@ -356,37 +356,7 @@ def main() -> None:
                         sum(hand.landmarks_2d[i][1] for i in palm_indices)
                         / len(palm_indices)
                     )
-                    target_center = (int(avg_x), int(avg_y))
-                    if state.center is None:
-                        state.center = target_center
-                    else:
-                        delta_x = target_center[0] - state.center[0]
-                        delta_y = target_center[1] - state.center[1]
-                        distance = math.hypot(delta_x, delta_y)
-                        if distance > args.max_anchor_step and distance > 0:
-                            scale = args.max_anchor_step / distance
-                            target_center = (
-                                int(state.center[0] + delta_x * scale),
-                                int(state.center[1] + delta_y * scale),
-                            )
-                        state.center = (
-                            int(
-                                _lerp(
-                                    state.center[0],
-                                    target_center[0],
-                                    args.anchor_smoothing,
-                                )
-                            ),
-                            int(
-                                _lerp(
-                                    state.center[1],
-                                    target_center[1],
-                                    args.anchor_smoothing,
-                                )
-                            ),
-                        )
-                else:
-                    state.center = (width // 2, height // 2)
+                    palm_center = (int(avg_x), int(avg_y))
 
             else:
                 if time.time() - state.last_hand_time > 0.5:
@@ -404,6 +374,7 @@ def main() -> None:
             )
             bounds = _cube_bounds(projected)
 
+            inside = False
             if tip:
                 min_x, min_y, max_x, max_y = bounds
                 padding = 12
@@ -426,6 +397,51 @@ def main() -> None:
                 else:
                     state.dragging = False
                 state.last_tip = tip
+
+            if args.cube_anchor == "center":
+                state.center = (width // 2, height // 2)
+            elif palm_center is not None:
+                target_center = palm_center
+                anchor_smoothing = args.anchor_smoothing
+                if pinch and inside and tip:
+                    blend = 0.65
+                    target_center = (
+                        int(palm_center[0] * (1 - blend) + tip[0] * blend),
+                        int(palm_center[1] * (1 - blend) + tip[1] * blend),
+                    )
+                    anchor_smoothing = max(anchor_smoothing, 0.22)
+                if state.center is None:
+                    state.center = target_center
+                else:
+                    delta_x = target_center[0] - state.center[0]
+                    delta_y = target_center[1] - state.center[1]
+                    distance = math.hypot(delta_x, delta_y)
+                    if distance > args.max_anchor_step and distance > 0:
+                        scale = args.max_anchor_step / distance
+                        target_center = (
+                            int(state.center[0] + delta_x * scale),
+                            int(state.center[1] + delta_y * scale),
+                        )
+                    state.center = (
+                        int(_lerp(state.center[0], target_center[0], anchor_smoothing)),
+                        int(_lerp(state.center[1], target_center[1], anchor_smoothing)),
+                    )
+
+            active_rotation_smoothing = args.rotation_smoothing
+            if state.dragging:
+                active_rotation_smoothing = max(active_rotation_smoothing, 0.25)
+            state.yaw = _lerp(state.yaw, state.yaw_target, active_rotation_smoothing)
+            state.pitch = _lerp(state.pitch, state.pitch_target, active_rotation_smoothing)
+
+            projected, rotated = _project_cube(
+                state.center or (width // 2, height // 2),
+                args.cube_size,
+                state.yaw,
+                state.pitch,
+                focal_length,
+                args.cube_distance,
+            )
+
             _draw_cube(frame, projected, rotated, state.dragging)
 
             if hand_results:
@@ -435,9 +451,6 @@ def main() -> None:
                 cv2.circle(frame, tip, 6, (0, 255, 255) if pinch else (0, 180, 255), -1)
 
             _draw_trail(frame, state.trail)
-
-            state.yaw = _lerp(state.yaw, state.yaw_target, args.rotation_smoothing)
-            state.pitch = _lerp(state.pitch, state.pitch_target, args.rotation_smoothing)
 
             if pinch and tip:
                 cv2.putText(
