@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
 import math
 import sys
 import time
-from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -17,61 +16,37 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from cv3d.hand_tracking import HandTracker
+from cv3d.cube_render import CubeRenderer
+from cv3d.data_logger import DataLogger, LoggerConfig
+from cv3d.gesture_model import GestureConfig, GestureTracker
+from cv3d.hand_input import HandInput
+from cv3d.hand_menu import HandMenu, MenuItem
+from cv3d.orb_render import OrbRenderer
+from cv3d.palette import (
+    IOS_BLUE,
+    IOS_BLUE_SOFT,
+    IOS_BORDER,
+    IOS_GLASS,
+    IOS_TEXT,
+)
+from cv3d.pipeline import HandWorker, ThreadedCapture
+from cv3d.physics import CubePhysics, CubeState, PhysicsConfig, compute_dt
+from cv3d.ui import draw_glass_panel, draw_rounded_rect, draw_text
 
 
-@dataclass
-class CubeState:
-    yaw: float = 20.0
-    pitch: float = -15.0
-    yaw_target: float = 20.0
-    pitch_target: float = -15.0
-    dragging: bool = False
-    last_tip: Optional[Tuple[int, int]] = None
-    trail: Deque[Tuple[int, int]] = field(default_factory=lambda: deque(maxlen=32))
-    last_hand_time: float = 0.0
-    center: Optional[Tuple[int, int]] = None
-
-
-BASE_VERTICES = [
-    (-0.5, -0.5, -0.5),
-    (0.5, -0.5, -0.5),
-    (0.5, 0.5, -0.5),
-    (-0.5, 0.5, -0.5),
-    (-0.5, -0.5, 0.5),
-    (0.5, -0.5, 0.5),
-    (0.5, 0.5, 0.5),
-    (-0.5, 0.5, 0.5),
-]
-
-EDGES = [
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 0),
-    (4, 5),
-    (5, 6),
-    (6, 7),
-    (7, 4),
-    (0, 4),
-    (1, 5),
-    (2, 6),
-    (3, 7),
-]
-
-FACES = [
-    ([0, 1, 2, 3], (66, 166, 242)),
-    ([4, 5, 6, 7], (242, 140, 64)),
-    ([0, 1, 5, 4], (90, 190, 120)),
-    ([2, 3, 7, 6], (224, 120, 160)),
-    ([1, 2, 6, 5], (242, 222, 64)),
-    ([0, 3, 7, 4], (90, 110, 242)),
-]
+def _parse_hsv(value: str) -> tuple[int, int, int]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("HSV values must be in H,S,V format.")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("HSV values must be integers.") from exc
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Overlay a 3D cube on the camera feed and rotate it by touch."
+        description="Overlay 3D cubes on the camera feed and push them with your hand."
     )
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument(
@@ -103,23 +78,328 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="(Deprecated) camera feed is always shown in this demo.",
     )
-    parser.add_argument("--max-hands", type=int, default=1)
+    parser.add_argument(
+        "--input-mode",
+        choices=("mediapipe", "blue-glove", "hybrid"),
+        default="hybrid",
+        help="Hand input mode; use blue-glove for colored glove tracking.",
+    )
+    parser.add_argument(
+        "--glove-lower",
+        type=_parse_hsv,
+        default=(90, 60, 50),
+        help="Lower HSV bound for blue glove detection (H,S,V).",
+    )
+    parser.add_argument(
+        "--glove-upper",
+        type=_parse_hsv,
+        default=(130, 255, 255),
+        help="Upper HSV bound for blue glove detection (H,S,V).",
+    )
+    parser.add_argument(
+        "--glove-min-area",
+        type=float,
+        default=800.0,
+        help="Minimum contour area for glove detection.",
+    )
+    parser.add_argument(
+        "--glove-kernel",
+        type=int,
+        default=3,
+        help="Kernel size for glove mask morphology.",
+    )
+    parser.add_argument(
+        "--glove-open",
+        type=int,
+        default=0,
+        help="Morphology open iterations for glove mask.",
+    )
+    parser.add_argument(
+        "--glove-close",
+        type=int,
+        default=1,
+        help="Morphology close iterations for glove mask.",
+    )
+    parser.add_argument(
+        "--glove-dilate",
+        type=int,
+        default=1,
+        help="Dilation iterations for glove mask.",
+    )
+    parser.add_argument(
+        "--glove-contour-epsilon",
+        type=float,
+        default=0.008,
+        help="Contour approximation epsilon (fraction of arc length).",
+    )
+    parser.add_argument(
+        "--show-mask",
+        action="store_true",
+        help="Show the glove segmentation mask for tuning HSV bounds.",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Directory to write a logging session (JSONL + optional images).",
+    )
+    parser.add_argument(
+        "--log-frames",
+        action="store_true",
+        help="Save raw camera frames as JPEGs.",
+    )
+    parser.add_argument(
+        "--log-overlay",
+        action="store_true",
+        help="Save overlay frames (with UI/cubes) as JPEGs.",
+    )
+    parser.add_argument(
+        "--log-mask",
+        action="store_true",
+        help="Save hand masks as PNGs when available.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Log every Nth frame.",
+    )
+    parser.add_argument(
+        "--log-jpeg-quality",
+        type=int,
+        default=90,
+        help="JPEG quality for logged frames (0-100).",
+    )
+    parser.add_argument(
+        "--log-queue",
+        type=int,
+        default=256,
+        help="Max queued log items before dropping frames.",
+    )
+    parser.add_argument(
+        "--show-gestures",
+        action="store_true",
+        help="Overlay the gesture model labels near each hand.",
+    )
+    parser.add_argument(
+        "--gesture-smoothing",
+        type=float,
+        default=0.6,
+        help="Smoothing factor for gesture classification (0-1).",
+    )
+    parser.add_argument(
+        "--gesture-min-confidence",
+        type=float,
+        default=0.25,
+        help="Minimum confidence required to show a gesture label.",
+    )
+    parser.add_argument(
+        "--no-threaded",
+        action="store_true",
+        help="Disable threaded camera capture.",
+    )
+    parser.add_argument(
+        "--no-hand-worker",
+        action="store_true",
+        help="Process hand tracking on the main thread.",
+    )
+    parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--min-detection-confidence", type=float, default=0.5)
     parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
-    parser.add_argument("--trail-length", type=int, default=32)
-    parser.add_argument("--sensitivity", type=float, default=0.32)
-    parser.add_argument("--rotation-smoothing", type=float, default=0.18)
-    parser.add_argument("--anchor-smoothing", type=float, default=0.14)
-    parser.add_argument("--max-anchor-step", type=float, default=40.0)
-    parser.add_argument("--cube-size", type=float, default=0.6)
-    parser.add_argument("--cube-distance", type=float, default=5.8)
+    parser.add_argument(
+        "--pinch-ratio",
+        type=float,
+        default=0.45,
+        help="Pinch threshold as a fraction of palm size.",
+    )
+    parser.add_argument(
+        "--open-ratio",
+        type=float,
+        default=1.6,
+        help="Open palm threshold as a ratio of fingertip distance to palm size.",
+    )
+    parser.add_argument(
+        "--press-depth",
+        type=float,
+        default=0.05,
+        help="Depth threshold for a fingertip press gesture.",
+    )
+    parser.add_argument(
+        "--menu-scale",
+        type=float,
+        default=2.5,
+        help="Scale the size of the hand menu.",
+    )
+    parser.add_argument(
+        "--menu-open-hold",
+        type=float,
+        default=1.6,
+        help="Seconds to hold the open-palm gesture to toggle the menu.",
+    )
+    parser.add_argument(
+        "--menu-open-strength",
+        type=float,
+        default=0.35,
+        help="Minimum open-palm strength to allow menu toggle.",
+    )
+    parser.add_argument(
+        "--grip-ratio",
+        type=float,
+        default=1.1,
+        help="Grip threshold as a ratio of fingertip distance to palm size.",
+    )
+    parser.add_argument(
+        "--anchor-smoothing",
+        type=float,
+        default=None,
+        help="Deprecated: no longer used.",
+    )
+    parser.add_argument(
+        "--max-anchor-step",
+        type=float,
+        default=None,
+        help="Deprecated: no longer used.",
+    )
     parser.add_argument(
         "--cube-anchor",
         choices=("hand", "center"),
-        default="hand",
-        help="Anchor the cube to the palm or keep it centered.",
+        default=None,
+        help="Deprecated: no longer used.",
+    )
+    parser.add_argument("--contact-force", type=float, default=900.0)
+    parser.add_argument("--hand-velocity-scale", type=float, default=0.7)
+    parser.add_argument("--contact-distance", type=float, default=8.0)
+    parser.add_argument("--gravity", type=float, default=1600.0)
+    parser.add_argument("--grab-distance", type=float, default=120.0)
+    parser.add_argument("--grab-strength", type=float, default=30.0)
+    parser.add_argument("--grab-damping", type=float, default=0.85)
+    parser.add_argument("--grab-follow", type=float, default=0.7)
+    parser.add_argument("--damping", type=float, default=0.92)
+    parser.add_argument("--restitution", type=float, default=0.86)
+    parser.add_argument("--max-speed", type=float, default=1400.0)
+    parser.add_argument("--rotation-smoothing", type=float, default=0.2)
+    parser.add_argument("--spin-strength", type=float, default=0.2)
+    parser.add_argument("--num-cubes", type=int, default=3)
+    parser.add_argument("--cube-size", type=float, default=0.7)
+    parser.add_argument("--cube-distance", type=float, default=5.8)
+    parser.add_argument("--num-orbs", type=int, default=1)
+    parser.add_argument("--orb-size", type=float, default=0.5)
+    parser.add_argument("--max-orbs", type=int, default=6)
+    parser.add_argument(
+        "--power-shockwave",
+        type=float,
+        default=1200.0,
+        help="Shockwave impulse strength for fist gesture (0 disables).",
+    )
+    parser.add_argument(
+        "--power-shockwave-radius",
+        type=float,
+        default=260.0,
+        help="Shockwave radius in pixels.",
+    )
+    parser.add_argument(
+        "--power-shockwave-cooldown",
+        type=float,
+        default=0.6,
+        help="Cooldown between fist shockwaves.",
+    )
+    parser.add_argument(
+        "--power-tractor",
+        type=float,
+        default=520.0,
+        help="Tractor pull strength for open-palm gesture (0 disables).",
+    )
+    parser.add_argument(
+        "--power-tractor-radius",
+        type=float,
+        default=280.0,
+        help="Tractor pull radius in pixels.",
+    )
+    parser.add_argument(
+        "--power-laser",
+        type=float,
+        default=900.0,
+        help="Laser push strength for point gesture (0 disables).",
+    )
+    parser.add_argument(
+        "--power-laser-range",
+        type=float,
+        default=420.0,
+        help="Laser range in pixels.",
+    )
+    parser.add_argument(
+        "--power-laser-width",
+        type=float,
+        default=60.0,
+        help="Laser width in pixels.",
+    )
+    parser.add_argument(
+        "--power-spawn-cooldown",
+        type=float,
+        default=0.9,
+        help="Cooldown between two-finger spawns.",
+    )
+    parser.add_argument(
+        "--power-spawn-velocity",
+        type=float,
+        default=0.8,
+        help="Velocity scale for spawned orbs (relative to hand velocity).",
     )
     return parser.parse_args()
+
+
+@dataclass
+class SceneObject:
+    kind: str
+    state: CubeState
+    size: float
+
+
+@dataclass
+class PowerConfig:
+    shockwave_strength: float
+    shockwave_radius: float
+    shockwave_cooldown: float
+    tractor_strength: float
+    tractor_radius: float
+    laser_strength: float
+    laser_range: float
+    laser_width: float
+    spawn_cooldown: float
+    spawn_velocity_scale: float
+    max_orbs: int
+    orb_size: float
+
+
+def _make_object(kind: str, size: float) -> SceneObject:
+    return SceneObject(kind=kind, state=CubeState(), size=size)
+
+
+def _count_objects(objects: list[SceneObject], kind: str) -> int:
+    return sum(1 for obj in objects if obj.kind == kind)
+
+
+def _set_object_count(
+    objects: list[SceneObject], kind: str, target: int, size: float
+) -> None:
+    target = max(0, int(target))
+    current = _count_objects(objects, kind)
+    if target > current:
+        for _ in range(target - current):
+            objects.append(_make_object(kind, size))
+    elif target < current:
+        remove = current - target
+        for idx in range(len(objects) - 1, -1, -1):
+            if objects[idx].kind != kind:
+                continue
+            del objects[idx]
+            remove -= 1
+            if remove <= 0:
+                break
+
+
+def _avg_scale(scale: tuple[float, float, float]) -> float:
+    return max(0.2, (scale[0] + scale[1] + scale[2]) / 3.0)
 
 
 def _backend_from_name(name: str) -> int | None:
@@ -140,14 +420,6 @@ def _open_camera(index: int, backend: int | None) -> cv2.VideoCapture:
     return cv2.VideoCapture(index, backend)
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def _lerp(current: float, target: float, alpha: float) -> float:
-    return current + alpha * (target - current)
-
-
 def _is_black_frame(frame) -> bool:
     if frame is None or frame.size == 0:
         return True
@@ -166,114 +438,498 @@ def _black_frame_message(index: int, backend: str) -> str:
     )
 
 
-def _rotate_point(point: Tuple[float, float, float], yaw: float, pitch: float) -> Tuple[float, float, float]:
-    x, y, z = point
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    cos_p, sin_p = math.cos(pitch), math.sin(pitch)
-    xz = x * cos_y + z * sin_y
-    zz = -x * sin_y + z * cos_y
-    yz = y * cos_p - zz * sin_p
-    zz = y * sin_p + zz * cos_p
-    return xz, yz, zz
+def _set_cube_count(objects: list[SceneObject], value: float, cube_size: float) -> None:
+    target = int(round(value))
+    target = max(1, min(target, 5))
+    _set_object_count(objects, "cube", target, cube_size)
 
 
-def _project_cube(
-    center: Tuple[int, int],
-    size: float,
-    yaw_deg: float,
-    pitch_deg: float,
-    focal_length: float,
-    distance: float,
-) -> Tuple[list[Tuple[int, int]], list[Tuple[float, float, float]]]:
-    yaw = math.radians(yaw_deg)
-    pitch = math.radians(pitch_deg)
-    cx, cy = center
-    projected: list[Tuple[int, int]] = []
-    rotated: list[Tuple[float, float, float]] = []
-    for vx, vy, vz in BASE_VERTICES:
-        point = (vx * size, vy * size, vz * size)
-        rx, ry, rz = _rotate_point(point, yaw, pitch)
-        rz += distance
-        rotated.append((rx, ry, rz))
-        if rz <= 0.01:
-            rz = 0.01
-        u = int(cx + (focal_length * rx / rz))
-        v = int(cy + (focal_length * ry / rz))
-        projected.append((u, v))
-    return projected, rotated
-
-
-def _normalize(vec: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    x, y, z = vec
-    length = math.sqrt(x * x + y * y + z * z) or 1.0
-    return x / length, y / length, z / length
-
-
-def _face_normal(
-    v0: Tuple[float, float, float],
-    v1: Tuple[float, float, float],
-    v2: Tuple[float, float, float],
-) -> Tuple[float, float, float]:
-    ax, ay, az = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
-    bx, by, bz = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
-    nx = ay * bz - az * by
-    ny = az * bx - ax * bz
-    nz = ax * by - ay * bx
-    return _normalize((nx, ny, nz))
-
-
-def _draw_cube(
-    frame,
-    projected: list[Tuple[int, int]],
-    rotated: list[Tuple[float, float, float]],
-    highlight: bool,
+def _set_orb_count(
+    objects: list[SceneObject], value: float, orb_size: float, max_orbs: int
 ) -> None:
-    light_dir = _normalize((0.6, 0.9, 0.4))
-    face_depths = []
-    for face_indices, base_color in FACES:
-        verts = [rotated[idx] for idx in face_indices]
-        avg_z = sum(v[2] for v in verts) / len(verts)
-        normal = _face_normal(verts[0], verts[1], verts[2])
-        intensity = max(
-            normal[0] * light_dir[0] + normal[1] * light_dir[1] + normal[2] * light_dir[2],
-            0.2,
-        )
-        shade = tuple(int(c * intensity) for c in base_color)
-        face_depths.append((avg_z, face_indices, shade))
-
-    for _avg_z, face_indices, shade in sorted(face_depths, key=lambda item: item[0], reverse=True):
-        pts = [projected[idx] for idx in face_indices]
-        cv2.fillConvexPoly(frame, _to_poly(pts), shade)
-
-    if highlight:
-        edge_color = (0, 220, 255)
-        for start, end in EDGES:
-            cv2.line(frame, projected[start], projected[end], edge_color, 2)
+    target = int(round(value))
+    target = max(0, min(target, max_orbs))
+    _set_object_count(objects, "orb", target, orb_size)
 
 
-def _cube_bounds(projected: list[Tuple[int, int]]) -> Tuple[int, int, int, int]:
-    xs = [p[0] for p in projected]
-    ys = [p[1] for p in projected]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def _to_poly(points: list[Tuple[int, int]]):
-    return np.array(points, dtype=np.int32).reshape((-1, 1, 2))
-
-
-def _draw_trail(frame, trail: Deque[Tuple[int, int]]) -> None:
-    if len(trail) < 2:
+def _draw_stats(frame, lines, anchor=(18, 18)) -> None:
+    if not lines:
         return
-    points = list(trail)
-    for i in range(1, len(points)):
-        alpha = i / len(points)
-        color = (int(255 * (1 - alpha)), int(120 + 100 * alpha), 255)
-        cv2.line(frame, points[i - 1], points[i], color, 2)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness = 1
+    padding = 10
+    line_height = 20
+    text_sizes = [cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines]
+    width = max(size[0] for size in text_sizes) + padding * 2
+    height = line_height * len(lines) + padding * 2
+    x, y = anchor
+    panel = (x, y, width, height)
+    radius = max(10, int(min(width, height) * 0.08))
+    draw_glass_panel(
+        frame,
+        panel,
+        radius,
+        IOS_GLASS,
+        IOS_BORDER,
+        border_thickness=1,
+        tint_alpha=0.28,
+        blur_sigma=12.0,
+        shadow=True,
+        shadow_alpha=0.2,
+    )
+    for idx, line in enumerate(lines):
+        text_y = y + padding + line_height * (idx + 1) - 4
+        draw_text(
+            frame,
+            line,
+            (x + padding, text_y),
+            font,
+            font_scale,
+            IOS_TEXT,
+            1,
+            shadow=False,
+        )
+
+
+def _draw_graph(frame, values, label: str, anchor=(18, 220)) -> None:
+    if len(values) < 2:
+        return
+    panel_w = 260
+    panel_h = 140
+    padding = 12
+    x, y = anchor
+    panel = (x, y, panel_w, panel_h)
+    radius = max(10, int(min(panel_w, panel_h) * 0.08))
+    draw_glass_panel(
+        frame,
+        panel,
+        radius,
+        IOS_GLASS,
+        IOS_BORDER,
+        border_thickness=1,
+        tint_alpha=0.28,
+        blur_sigma=12.0,
+        shadow=True,
+        shadow_alpha=0.2,
+    )
+    draw_text(
+        frame,
+        label,
+        (x + padding, y + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        IOS_TEXT,
+        1,
+        shadow=False,
+    )
+    graph_left = x + padding
+    graph_right = x + panel_w - padding
+    graph_top = y + 30
+    graph_bottom = y + panel_h - padding
+    max_value = max(values) if values else 1.0
+    max_value = max(max_value, 1.0)
+    step = (graph_right - graph_left) / float(len(values) - 1)
+    points = []
+    for idx, value in enumerate(values):
+        ratio = max(0.0, min(1.0, value / max_value))
+        px = int(graph_left + idx * step)
+        py = int(graph_bottom - ratio * (graph_bottom - graph_top))
+        points.append((px, py))
+    if len(points) >= 2:
+        cv2.polylines(frame, [np.array(points, dtype=np.int32)], False, IOS_BLUE, 2)
+
+
+def _draw_gesture_labels(frame, hands, results, min_confidence: float) -> None:
+    if not results:
+        return
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.5
+    padding = 6
+    frame_h, frame_w = frame.shape[:2]
+    for hand in hands:
+        result = results.get(hand.id)
+        if result is None or result.label == "unknown":
+            continue
+        if result.confidence < min_confidence:
+            continue
+        label = result.label.upper()
+        text_size = cv2.getTextSize(label, font, scale, 1)[0]
+        box_w = text_size[0] + padding * 2
+        box_h = text_size[1] + padding * 2
+        pointer = hand.center
+        if getattr(hand, "landmarks_2d", None) and len(hand.landmarks_2d) > 8:
+            pointer = hand.landmarks_2d[8]
+        x = int(pointer[0] - box_w / 2)
+        y = int(pointer[1] - box_h - 16)
+        x = max(8, min(x, frame_w - box_w - 8))
+        y = max(8, min(y, frame_h - box_h - 8))
+        rect = (x, y, box_w, box_h)
+        draw_glass_panel(
+            frame,
+            rect,
+            max(6, int(box_h * 0.4)),
+            IOS_GLASS,
+            IOS_BORDER,
+            border_thickness=1,
+            tint_alpha=0.28,
+            blur_sigma=10.0,
+            shadow=True,
+            shadow_alpha=0.2,
+        )
+        draw_text(
+            frame,
+            label,
+            (x + padding, y + padding + text_size[1]),
+            font,
+            scale,
+            IOS_TEXT,
+            1,
+            shadow=False,
+        )
+
+
+PALM_INDICES = (0, 5, 9, 13, 17)
+
+
+def _hand_palm_center(hand) -> tuple[float, float]:
+    points = getattr(hand, "landmarks_2d", None)
+    if points and len(points) >= 21:
+        return (
+            sum(points[idx][0] for idx in PALM_INDICES) / len(PALM_INDICES),
+            sum(points[idx][1] for idx in PALM_INDICES) / len(PALM_INDICES),
+        )
+    return hand.center
+
+
+def _apply_shockwave(
+    objects: list[SceneObject],
+    origin: tuple[float, float],
+    strength: float,
+    radius: float,
+    dt: float,
+) -> None:
+    if strength <= 0.0 or radius <= 0.0:
+        return
+    for obj in objects:
+        state = obj.state
+        if state.position is None:
+            continue
+        dx = state.position[0] - origin[0]
+        dy = state.position[1] - origin[1]
+        dist = math.hypot(dx, dy)
+        if dist <= 1e-3 or dist > radius:
+            continue
+        nx, ny = dx / dist, dy / dist
+        scale = 1.0 - dist / radius
+        impulse = strength * scale * dt
+        state.velocity = (state.velocity[0] + nx * impulse, state.velocity[1] + ny * impulse)
+        state.yaw_target += nx * impulse * 0.01
+        state.pitch_target -= ny * impulse * 0.01
+
+
+def _apply_tractor(
+    objects: list[SceneObject],
+    origin: tuple[float, float],
+    strength: float,
+    radius: float,
+    dt: float,
+) -> None:
+    if strength <= 0.0 or radius <= 0.0:
+        return
+    for obj in objects:
+        state = obj.state
+        if state.position is None:
+            continue
+        dx = origin[0] - state.position[0]
+        dy = origin[1] - state.position[1]
+        dist = math.hypot(dx, dy)
+        if dist <= 1e-3 or dist > radius:
+            continue
+        nx, ny = dx / dist, dy / dist
+        scale = 1.0 - dist / radius
+        impulse = strength * scale * dt
+        state.velocity = (state.velocity[0] + nx * impulse, state.velocity[1] + ny * impulse)
+
+
+def _apply_laser(
+    objects: list[SceneObject],
+    origin: tuple[float, float],
+    direction: tuple[float, float],
+    strength: float,
+    laser_range: float,
+    width: float,
+    dt: float,
+) -> None:
+    if strength <= 0.0 or laser_range <= 0.0 or width <= 0.0:
+        return
+    dir_x, dir_y = direction
+    for obj in objects:
+        state = obj.state
+        if state.position is None:
+            continue
+        to_x = state.position[0] - origin[0]
+        to_y = state.position[1] - origin[1]
+        proj = to_x * dir_x + to_y * dir_y
+        if proj <= 0.0 or proj > laser_range:
+            continue
+        dist_sq = to_x * to_x + to_y * to_y
+        perp_sq = max(0.0, dist_sq - proj * proj)
+        perp = math.sqrt(perp_sq)
+        if perp > width:
+            continue
+        scale = (1.0 - proj / laser_range) * (1.0 - perp / width)
+        impulse = strength * scale * dt
+        state.velocity = (
+            state.velocity[0] + dir_x * impulse,
+            state.velocity[1] + dir_y * impulse,
+        )
+
+
+def _spawn_orb(
+    objects: list[SceneObject],
+    origin: tuple[float, float],
+    velocity: tuple[float, float],
+    size: float,
+    max_orbs: int,
+) -> bool:
+    if _count_objects(objects, "orb") >= max_orbs:
+        return False
+    obj = _make_object("orb", size)
+    obj.state.position = (origin[0], origin[1])
+    obj.state.velocity = velocity
+    obj.state.yaw = 0.0
+    obj.state.pitch = 0.0
+    obj.state.yaw_target = 0.0
+    obj.state.pitch_target = 0.0
+    objects.append(obj)
+    return True
+
+
+def _apply_gesture_powers(
+    objects: list[SceneObject],
+    hands,
+    gestures,
+    gesture_state: dict[int, dict[str, float | str]],
+    now: float,
+    dt: float,
+    config: PowerConfig,
+    min_confidence: float,
+) -> None:
+    if not gestures:
+        return
+    active_ids = set()
+    spawn_requests = 0
+    for hand in hands:
+        result = gestures.get(hand.id)
+        if result is None or result.label == "unknown":
+            continue
+        if result.confidence < min_confidence:
+            continue
+        active_ids.add(hand.id)
+        state = gesture_state.setdefault(
+            hand.id, {"label": "unknown", "last_shockwave": 0.0, "last_spawn": 0.0}
+        )
+        prev_label = state["label"]
+        label = result.label
+        state["label"] = label
+
+        if (
+            label == "fist"
+            and prev_label != "fist"
+            and now - float(state["last_shockwave"]) > config.shockwave_cooldown
+        ):
+            _apply_shockwave(
+                objects,
+                hand.center,
+                config.shockwave_strength,
+                config.shockwave_radius,
+                dt,
+            )
+            state["last_shockwave"] = now
+
+        if (
+            label == "two"
+            and prev_label != "two"
+            and now - float(state["last_spawn"]) > config.spawn_cooldown
+        ):
+            spawn_requests += 1
+            state["last_spawn"] = now
+
+        if label == "open":
+            _apply_tractor(
+                objects,
+                hand.center,
+                config.tractor_strength,
+                config.tractor_radius,
+                dt,
+            )
+
+        if label == "point":
+            points = getattr(hand, "landmarks_2d", None)
+            if points and len(points) > 8:
+                palm = _hand_palm_center(hand)
+                tip = points[8]
+                dir_x = tip[0] - palm[0]
+                dir_y = tip[1] - palm[1]
+                length = math.hypot(dir_x, dir_y)
+                if length > 1.0:
+                    dir_x /= length
+                    dir_y /= length
+                    _apply_laser(
+                        objects,
+                        (tip[0], tip[1]),
+                        (dir_x, dir_y),
+                        config.laser_strength,
+                        config.laser_range,
+                        config.laser_width,
+                        dt,
+                    )
+
+    if spawn_requests > 0:
+        for _ in range(spawn_requests):
+            if _count_objects(objects, "orb") >= config.max_orbs:
+                break
+            for hand in hands:
+                result = gestures.get(hand.id)
+                if result is None or result.label != "two":
+                    continue
+                velocity = (
+                    hand.velocity[0] * config.spawn_velocity_scale,
+                    hand.velocity[1] * config.spawn_velocity_scale,
+                )
+                _spawn_orb(objects, hand.center, velocity, config.orb_size, config.max_orbs)
+                break
+
+    stale_ids = [hand_id for hand_id in gesture_state if hand_id not in active_ids]
+    for hand_id in stale_ids:
+        gesture_state.pop(hand_id, None)
+
+
+def _resolve_cube_collisions(states: list[CubeState], radii: list[float], restitution: float) -> None:
+    count = len(states)
+    if count < 2:
+        return
+    for i in range(count):
+        state_a = states[i]
+        if state_a.position is None:
+            continue
+        for j in range(i + 1, count):
+            state_b = states[j]
+            if state_b.position is None:
+                continue
+            ax, ay = state_a.position
+            bx, by = state_b.position
+            dx = bx - ax
+            dy = by - ay
+            dist = math.hypot(dx, dy)
+            min_dist = radii[i] + radii[j]
+            if dist < 1e-6:
+                nx, ny = 1.0, 0.0
+                dist = 1.0
+            else:
+                nx, ny = dx / dist, dy / dist
+            if dist >= min_dist:
+                continue
+
+            overlap = min_dist - dist
+            ax -= nx * overlap * 0.5
+            ay -= ny * overlap * 0.5
+            bx += nx * overlap * 0.5
+            by += ny * overlap * 0.5
+            state_a.position = (ax, ay)
+            state_b.position = (bx, by)
+
+            avx, avy = state_a.velocity
+            bvx, bvy = state_b.velocity
+            rvx = bvx - avx
+            rvy = bvy - avy
+            vel_along = rvx * nx + rvy * ny
+            if vel_along < 0:
+                impulse = -(1.0 + restitution) * vel_along / 2.0
+                avx -= impulse * nx
+                avy -= impulse * ny
+                bvx += impulse * nx
+                bvy += impulse * ny
+                state_a.velocity = (avx, avy)
+                state_b.velocity = (bvx, bvy)
+
+            tangential = rvx * -ny + rvy * nx
+            spin = tangential * 0.02
+            state_a.yaw_target += spin
+            state_b.yaw_target -= spin
+
+
+def _point_in_rect(point: tuple[float, float], rect: tuple[int, int, int, int]) -> bool:
+    x, y, w, h = rect
+    return x <= point[0] <= x + w and y <= point[1] <= y + h
+
+
+def _top_bar_layout(frame_shape) -> tuple[int, int, int, int]:
+    height, width = frame_shape[:2]
+    button_w = int(max(96, width * 0.13))
+    button_h = int(max(34, height * 0.05))
+    x = width - button_w - int(max(16, width * 0.03))
+    y = int(max(14, height * 0.025))
+    return (x, y, button_w, button_h)
+
+
+def _draw_top_bar(frame, menu_open: bool, hover: bool) -> tuple[int, int, int, int]:
+    button_rect = _top_bar_layout(frame.shape)
+    x, y, w, h = button_rect
+    radius = max(1, h // 2)
+    draw_glass_panel(
+        frame,
+        button_rect,
+        radius,
+        IOS_GLASS,
+        IOS_BORDER,
+        border_thickness=1,
+        tint_alpha=0.3,
+        blur_sigma=12.0,
+        shadow=True,
+        shadow_alpha=0.22,
+    )
+    if menu_open or hover:
+        accent = IOS_BLUE if menu_open else IOS_BLUE_SOFT
+        draw_rounded_rect(frame, button_rect, radius, accent, 2)
+    label = "Controls" if not menu_open else "Close"
+    font_scale = 0.55
+    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0]
+    text_x = x + (w - text_size[0]) // 2
+    text_y = y + (h + text_size[1]) // 2
+    draw_text(
+        frame,
+        label,
+        (text_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        IOS_TEXT,
+        2,
+        shadow=False,
+    )
+    return button_rect
+
+
+def _handle_menu_button(
+    hands, frame_shape, last_toggle: float, cooldown: float, menu: HandMenu, now: float
+) -> tuple[bool, float]:
+    button_rect = _top_bar_layout(frame_shape)
+    hover = False
+    for hand in hands:
+        pointer = hand.center
+        if getattr(hand, "landmarks_2d", None) and len(hand.landmarks_2d) > 8:
+            pointer = hand.landmarks_2d[8]
+        if _point_in_rect(pointer, button_rect):
+            hover = True
+            if getattr(hand, "press", False) and now - last_toggle > cooldown:
+                menu.toggle(now)
+                return True, now
+    return hover, last_toggle
 
 
 def main() -> None:
     args = parse_args()
-    state = CubeState(trail=deque(maxlen=args.trail_length))
 
     backend = _backend_from_name(args.backend)
     cap = _open_camera(args.camera_index, backend)
@@ -288,28 +944,231 @@ def main() -> None:
         if not cap.isOpened():
             raise RuntimeError("Unable to open camera. Try a different --camera-index.")
 
-    tracker = HandTracker(
-        max_num_hands=args.max_hands,
+    threaded = not args.no_threaded
+
+    hand_input = HandInput(
+        max_hands=args.max_hands,
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
         model_path=args.model_path,
+        mode=args.input_mode,
+        glove_lower=args.glove_lower,
+        glove_upper=args.glove_upper,
+        glove_min_area=args.glove_min_area,
+        glove_kernel_size=args.glove_kernel,
+        glove_open=args.glove_open,
+        glove_close=args.glove_close,
+        glove_dilate=args.glove_dilate,
+        glove_contour_epsilon=args.glove_contour_epsilon,
+        pinch_ratio=args.pinch_ratio,
+        grip_ratio=args.grip_ratio,
+        open_ratio=args.open_ratio,
+        press_depth=args.press_depth,
     )
+    renderer = CubeRenderer(size=args.cube_size, distance=args.cube_distance)
+    orb_renderer = OrbRenderer(distance=args.cube_distance)
+    physics = CubePhysics(
+        PhysicsConfig(
+            contact_force=args.contact_force,
+            hand_velocity_scale=args.hand_velocity_scale,
+            contact_distance=args.contact_distance,
+            gravity=args.gravity,
+            grab_distance=args.grab_distance,
+            grab_strength=args.grab_strength,
+            grab_damping=args.grab_damping,
+            grab_follow=args.grab_follow,
+            depth_scale_strength=0.0,
+            damping=args.damping,
+            restitution=args.restitution,
+            max_speed=args.max_speed,
+            rotation_smoothing=args.rotation_smoothing,
+            spin_strength=args.spin_strength,
+        )
+    )
+    gesture_tracker = GestureTracker(
+        GestureConfig(
+            smoothing=args.gesture_smoothing,
+            min_confidence=args.gesture_min_confidence,
+        )
+    )
+    capture = ThreadedCapture(cap).start() if threaded else None
+    hand_worker = HandWorker(hand_input).start() if threaded and not args.no_hand_worker else None
+    logger = None
+    if args.log_dir is not None:
+        logger = DataLogger(
+            LoggerConfig(
+                root_dir=args.log_dir,
+                record_frames=args.log_frames,
+                record_overlay=args.log_overlay,
+                record_mask=args.log_mask,
+                every=args.log_every,
+                jpeg_quality=args.log_jpeg_quality,
+                queue_size=args.log_queue,
+            ),
+            metadata={"args": vars(args)},
+        ).start()
+    objects: list[SceneObject] = []
+    _set_object_count(objects, "cube", max(1, args.num_cubes), args.cube_size)
+    _set_object_count(
+        objects,
+        "orb",
+        max(0, min(args.num_orbs, args.max_orbs)),
+        args.orb_size,
+    )
+    clock_state = CubeState()
+    ui_flags = {"stats": False, "graphs": False}
+    speed_history = deque(maxlen=120)
+    menu_toggle_time = 0.0
+    menu_hover = False
+    fps_value = 0.0
+    gesture_state: dict[int, dict[str, float | str]] = {}
+    power_config = PowerConfig(
+        shockwave_strength=args.power_shockwave,
+        shockwave_radius=args.power_shockwave_radius,
+        shockwave_cooldown=args.power_shockwave_cooldown,
+        tractor_strength=args.power_tractor,
+        tractor_radius=args.power_tractor_radius,
+        laser_strength=args.power_laser,
+        laser_range=args.power_laser_range,
+        laser_width=args.power_laser_width,
+        spawn_cooldown=args.power_spawn_cooldown,
+        spawn_velocity_scale=args.power_spawn_velocity,
+        max_orbs=max(0, args.max_orbs),
+        orb_size=args.orb_size,
+    )
+
+    def _toggle_stats() -> None:
+        ui_flags["stats"] = not ui_flags["stats"]
+
+    def _toggle_graphs() -> None:
+        ui_flags["graphs"] = not ui_flags["graphs"]
+
+    menu = HandMenu(
+        [
+            MenuItem(
+                "Gravity",
+                lambda: physics.config.gravity,
+                lambda value: setattr(physics.config, "gravity", max(0.0, float(value))),
+                0.0,
+                2000.0,
+                50.0,
+                "{:.0f}",
+            ),
+            MenuItem(
+                "Contact",
+                lambda: physics.config.contact_force,
+                lambda value: setattr(physics.config, "contact_force", max(0.0, float(value))),
+                300.0,
+                2000.0,
+                50.0,
+                "{:.0f}",
+            ),
+            MenuItem(
+                "Cubes",
+                lambda: float(_count_objects(objects, "cube")),
+                lambda value: _set_cube_count(objects, value, args.cube_size),
+                1.0,
+                5.0,
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Orbs",
+                lambda: float(_count_objects(objects, "orb")),
+                lambda value: _set_orb_count(objects, value, args.orb_size, args.max_orbs),
+                0.0,
+                float(max(0, args.max_orbs)),
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Pinch",
+                hand_input.get_pinch_ratio,
+                hand_input.set_pinch_ratio,
+                0.35,
+                0.6,
+                0.02,
+                "{:.2f}",
+            ),
+            MenuItem(
+                "Grip",
+                hand_input.get_grip_ratio,
+                hand_input.set_grip_ratio,
+                0.8,
+                1.4,
+                0.05,
+                "{:.2f}",
+            ),
+            MenuItem(
+                "Stats",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_stats,
+                state=lambda: ui_flags["stats"],
+            ),
+            MenuItem(
+                "Graphs",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_graphs,
+                state=lambda: ui_flags["graphs"],
+            ),
+        ],
+        open_hold=args.menu_open_hold,
+        toggle_cooldown=1.0,
+        open_strength_threshold=args.menu_open_strength,
+        scale=args.menu_scale,
+        use_open_gesture=False,
+    )
+
+    def _restart_capture(index: int) -> bool:
+        nonlocal cap, capture
+        if capture is not None:
+            capture.release()
+            capture = None
+        else:
+            cap.release()
+        cap = _open_camera(index, backend)
+        if not cap.isOpened():
+            return False
+        if threaded:
+            capture = ThreadedCapture(cap).start()
+        return True
 
     try:
         black_frames = 0
         max_black_frames = 60
+        frame_id_counter = 0
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.01)
+            if capture is not None:
+                ok, frame, frame_id = capture.read()
+            else:
+                ok, frame = cap.read()
+                if ok:
+                    frame_id_counter += 1
+                frame_id = frame_id_counter
+            if not ok or frame is None:
+                time.sleep(0.005)
                 continue
 
             if args.flip:
                 frame = cv2.flip(frame, 1)
 
+            base_frame = frame.copy()
+
             height, width = frame.shape[:2]
-            if state.center is None:
-                state.center = (width // 2, height // 2)
             focal_length = width * 0.9
 
             if _is_black_frame(frame):
@@ -321,155 +1180,240 @@ def main() -> None:
                 message = _black_frame_message(camera_index, args.backend)
                 print(message)
                 if args.auto_camera and camera_index < args.max_camera_index:
-                    cap.release()
                     camera_index += 1
-                    cap = _open_camera(camera_index, backend)
+                    if not _restart_capture(camera_index):
+                        raise RuntimeError(message)
                     black_frames = 0
                     continue
                 raise RuntimeError(message)
 
-            results = tracker.process(frame)
-            hand_results = None
-            tip = None
-            pinch = False
-            palm_center = None
-            if results:
-                hand_results = results
-                hand = results[0]
-                tip = hand.landmarks_2d[8]
-                thumb_tip = hand.landmarks_2d[4]
-                dx = tip[0] - thumb_tip[0]
-                dy = tip[1] - thumb_tip[1]
-                pinch_distance = math.hypot(dx, dy)
-                pinch_threshold = max(30.0, width * 0.05)
-                pinch = pinch_distance < pinch_threshold
-                state.trail.append(tip)
-                state.last_hand_time = time.time()
+            now = time.time()
+            dt = compute_dt(clock_state, now)
+            inst_fps = 1.0 / dt if dt > 0 else 0.0
+            fps_value = inst_fps if fps_value == 0.0 else fps_value * 0.9 + inst_fps * 0.1
 
-                if args.cube_anchor == "hand":
-                    palm_indices = (0, 5, 9, 13, 17)
-                    avg_x = (
-                        sum(hand.landmarks_2d[i][0] for i in palm_indices)
-                        / len(palm_indices)
-                    )
-                    avg_y = (
-                        sum(hand.landmarks_2d[i][1] for i in palm_indices)
-                        / len(palm_indices)
-                    )
-                    palm_center = (int(avg_x), int(avg_y))
-
+            if hand_worker is not None:
+                hand_worker.submit(base_frame, frame_id)
+                hands, _ = hand_worker.get()
             else:
-                if time.time() - state.last_hand_time > 0.5:
-                    state.trail.clear()
-                    state.dragging = False
-                    state.last_tip = None
-
-            projected, rotated = _project_cube(
-                state.center or (width // 2, height // 2),
-                args.cube_size,
-                state.yaw,
-                state.pitch,
-                focal_length,
-                args.cube_distance,
+                hands = hand_input.update(base_frame)
+            gesture_results = gesture_tracker.update(hands, now)
+            menu.update(hands, now, frame.shape)
+            menu_hover, menu_toggle_time = _handle_menu_button(
+                hands, frame.shape, menu_toggle_time, 0.35, menu, now
             )
-            bounds = _cube_bounds(projected)
+            menu.handle_input(hands, frame.shape, now)
 
-            inside = False
-            if tip:
-                min_x, min_y, max_x, max_y = bounds
-                padding = 12
-                inside = (
-                    (min_x - padding)
-                    <= tip[0]
-                    <= (max_x + padding)
-                    and (min_y - padding)
-                    <= tip[1]
-                    <= (max_y + padding)
-                )
-                if pinch and inside:
-                    if state.last_tip is not None:
-                        dx = tip[0] - state.last_tip[0]
-                        dy = tip[1] - state.last_tip[1]
-                        state.yaw_target += dx * args.sensitivity
-                        state.pitch_target -= dy * args.sensitivity
-                        state.pitch_target = _clamp(state.pitch_target, -80.0, 80.0)
-                    state.dragging = True
-                else:
-                    state.dragging = False
-                state.last_tip = tip
+            current_count = max(1, len(objects))
+            contact_any = False
+            for idx, obj in enumerate(objects):
+                state = obj.state
+                if state.position is None:
+                    if current_count == 1:
+                        start_x = width / 2.0
+                    else:
+                        spacing = width / float(current_count + 1)
+                        start_x = spacing * (idx + 1)
+                    start_y = height * (0.35 + 0.05 * (idx % 2))
+                    state.position = (start_x, start_y)
+                    state.yaw = 20.0 + idx * 12.0
+                    state.pitch = -15.0 + idx * 6.0
+                    state.yaw_target = state.yaw
+                    state.pitch_target = state.pitch
+                    state.velocity = (0.0, 0.0)
 
-            if args.cube_anchor == "center":
-                state.center = (width // 2, height // 2)
-            elif palm_center is not None:
-                target_center = palm_center
-                anchor_smoothing = args.anchor_smoothing
-                if pinch and inside and tip:
-                    blend = 0.65
-                    target_center = (
-                        int(palm_center[0] * (1 - blend) + tip[0] * blend),
-                        int(palm_center[1] * (1 - blend) + tip[1] * blend),
-                    )
-                    anchor_smoothing = max(anchor_smoothing, 0.22)
-                if state.center is None:
-                    state.center = target_center
-                else:
-                    delta_x = target_center[0] - state.center[0]
-                    delta_y = target_center[1] - state.center[1]
-                    distance = math.hypot(delta_x, delta_y)
-                    if distance > args.max_anchor_step and distance > 0:
-                        scale = args.max_anchor_step / distance
-                        target_center = (
-                            int(state.center[0] + delta_x * scale),
-                            int(state.center[1] + delta_y * scale),
-                        )
-                    state.center = (
-                        int(_lerp(state.center[0], target_center[0], anchor_smoothing)),
-                        int(_lerp(state.center[1], target_center[1], anchor_smoothing)),
-                    )
-
-            active_rotation_smoothing = args.rotation_smoothing
-            if state.dragging:
-                active_rotation_smoothing = max(active_rotation_smoothing, 0.25)
-            state.yaw = _lerp(state.yaw, state.yaw_target, active_rotation_smoothing)
-            state.pitch = _lerp(state.pitch, state.pitch_target, active_rotation_smoothing)
-
-            projected, rotated = _project_cube(
-                state.center or (width // 2, height // 2),
-                args.cube_size,
-                state.yaw,
-                state.pitch,
-                focal_length,
-                args.cube_distance,
+            _apply_gesture_powers(
+                objects,
+                hands,
+                gesture_results,
+                gesture_state,
+                now,
+                dt,
+                power_config,
+                max(args.gesture_min_confidence, 0.35),
             )
 
-            _draw_cube(frame, projected, rotated, state.dragging)
+            contact_flags: list[bool] = []
+            radii: list[float] = []
+            object_states: list[CubeState] = []
+            for obj in objects:
+                state = obj.state
+                if state.position is None:
+                    contact_flags.append(False)
+                    radii.append(0.0)
+                    object_states.append(state)
+                    continue
 
-            if hand_results:
-                tracker.draw(frame, hand_results)
+                if obj.kind == "cube":
+                    projected, _ = renderer.project(
+                        (int(state.position[0]), int(state.position[1])),
+                        state.yaw,
+                        state.pitch,
+                        focal_length,
+                        state.scale,
+                    )
+                    min_x, min_y, max_x, max_y = renderer.bounds(projected)
+                    half_w = max(6.0, (max_x - min_x) / 2.0)
+                    half_h = max(6.0, (max_y - min_y) / 2.0)
+                    contact_radius = max(2.0, min(half_w, half_h))
+                else:
+                    radius = orb_renderer.radius(
+                        focal_length, obj.size, _avg_scale(state.scale)
+                    )
+                    half_w = max(6.0, radius)
+                    half_h = max(6.0, radius)
+                    contact_radius = max(2.0, radius)
 
-            if tip:
-                cv2.circle(frame, tip, 6, (0, 255, 255) if pinch else (0, 180, 255), -1)
+                contact_infos = hand_input.contact_vectors(hands, state.position)
+                if contact_radius > 0:
+                    inflated_infos = []
+                    for info in contact_infos:
+                        if info is None:
+                            inflated_infos.append(None)
+                        else:
+                            distance, normal = info
+                            inflated_infos.append((distance - contact_radius, normal))
+                    contact_infos = inflated_infos
 
-            _draw_trail(frame, state.trail)
+                contact = physics.step(state, hands, contact_infos, dt)
+                contact_any = contact_any or contact
+                contact_flags.append(contact)
 
-            if pinch and tip:
-                cv2.putText(
+                if obj.kind == "cube":
+                    projected, _ = renderer.project(
+                        (int(state.position[0]), int(state.position[1])),
+                        state.yaw,
+                        state.pitch,
+                        focal_length,
+                        state.scale,
+                    )
+                    min_x, min_y, max_x, max_y = renderer.bounds(projected)
+                    half_w = max(6.0, (max_x - min_x) / 2.0)
+                    half_h = max(6.0, (max_y - min_y) / 2.0)
+                else:
+                    radius = orb_renderer.radius(
+                        focal_length, obj.size, _avg_scale(state.scale)
+                    )
+                    half_w = max(6.0, radius)
+                    half_h = max(6.0, radius)
+                physics.apply_bounds(state, width, height, half_w, half_h)
+                radii.append(max(half_w, half_h))
+                object_states.append(state)
+
+            if len(object_states) > 1:
+                _resolve_cube_collisions(object_states, radii, physics.config.restitution)
+
+            for obj, contact in zip(objects, contact_flags):
+                state = obj.state
+                if state.position is None:
+                    continue
+                if obj.kind == "cube":
+                    projected, rotated = renderer.project(
+                        (int(state.position[0]), int(state.position[1])),
+                        state.yaw,
+                        state.pitch,
+                        focal_length,
+                        state.scale,
+                    )
+                    min_x, min_y, max_x, max_y = renderer.bounds(projected)
+                    half_w = max(6.0, (max_x - min_x) / 2.0)
+                    half_h = max(6.0, (max_y - min_y) / 2.0)
+                    physics.apply_bounds(state, width, height, half_w, half_h)
+                    projected, rotated = renderer.project(
+                        (int(state.position[0]), int(state.position[1])),
+                        state.yaw,
+                        state.pitch,
+                        focal_length,
+                        state.scale,
+                    )
+                    renderer.draw(frame, projected, rotated, contact)
+                else:
+                    radius = orb_renderer.radius(
+                        focal_length, obj.size, _avg_scale(state.scale)
+                    )
+                    physics.apply_bounds(state, width, height, radius, radius)
+                    orb_renderer.draw(
+                        frame,
+                        (int(state.position[0]), int(state.position[1])),
+                        focal_length,
+                        obj.size,
+                        _avg_scale(state.scale),
+                        contact,
+                    )
+
+            if objects:
+                avg_speed = sum(
+                    math.hypot(obj.state.velocity[0], obj.state.velocity[1])
+                    for obj in objects
+                ) / len(objects)
+                speed_history.append(avg_speed)
+
+            mask = hand_input.stylized_mask(frame.shape)
+            if mask is not None:
+                frame[mask == 255] = base_frame[mask == 255]
+
+            hand_input.draw(frame)
+            menu.draw(frame)
+            _draw_top_bar(frame, menu.is_open, menu_hover)
+            if args.show_gestures:
+                _draw_gesture_labels(
                     frame,
-                    "touch + drag to rotate",
-                    (10, height - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2,
+                    hands,
+                    gesture_results,
+                    args.gesture_min_confidence,
                 )
+            if logger is not None:
+                log_mask = None
+                if args.log_mask:
+                    log_mask = hand_input.last_mask()
+                    if log_mask is None:
+                        log_mask = mask
+                    if log_mask is not None:
+                        log_mask = log_mask.copy()
+                logger.log(
+                    frame_id=frame_id,
+                    timestamp=now,
+                    fps=fps_value,
+                    hands=hands,
+                    gestures=gesture_results,
+                    cubes=objects,
+                    contact_flags=contact_flags,
+                    frame=base_frame if args.log_frames else None,
+                    overlay=frame if args.log_overlay else None,
+                    mask=log_mask,
+                )
+            if ui_flags["stats"]:
+                cube_count = _count_objects(objects, "cube")
+                orb_count = _count_objects(objects, "orb")
+                stats_lines = [
+                    f"FPS {fps_value:.1f}",
+                    f"Hands {len(hands)}",
+                    f"Cubes {cube_count} Orbs {orb_count}",
+                    f"Gravity {physics.config.gravity:.0f}",
+                    f"Contact {'YES' if contact_any else 'NO'}",
+                ]
+                _draw_stats(frame, stats_lines, anchor=(max(18, width - 260), 18))
+            if ui_flags["graphs"]:
+                _draw_graph(frame, list(speed_history), "Speed", anchor=(max(18, width - 280), max(220, height - 180)))
 
             cv2.imshow("Hand Cube", frame)
+            if args.show_mask and args.input_mode in ("blue-glove", "hybrid"):
+                mask = hand_input.last_mask()
+                if mask is not None:
+                    cv2.imshow("Glove Mask", mask)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
     finally:
-        tracker.close()
-        cap.release()
+        if hand_worker is not None:
+            hand_worker.stop()
+        hand_input.close()
+        if capture is not None:
+            capture.release()
+        else:
+            cap.release()
+        if logger is not None:
+            logger.close()
         cv2.destroyAllWindows()
 
 

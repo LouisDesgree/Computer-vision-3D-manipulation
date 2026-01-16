@@ -12,6 +12,7 @@ from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision.core.image import Image
 from mediapipe.tasks.python.vision.core.image import ImageFormat
 
+from .palette import IOS_BLUE, IOS_KNOB
 
 @dataclass
 class HandTrackingResult:
@@ -94,11 +95,11 @@ class HandTracker:
                     frame_bgr,
                     result.landmarks_2d[start_idx],
                     result.landmarks_2d[end_idx],
-                    (0, 220, 0),
+                    IOS_BLUE,
                     2,
                 )
             for point in result.landmarks_2d:
-                cv2.circle(frame_bgr, point, 3, (0, 0, 255), -1)
+                cv2.circle(frame_bgr, point, 3, IOS_KNOB, -1)
 
     def close(self) -> None:
         self._landmarker.close()

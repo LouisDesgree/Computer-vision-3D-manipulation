@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from cv3d.hand_tracking import HandTracker
+from cv3d.palette import IOS_BLUE
+from cv3d.pipeline import ThreadedCapture
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional path to hand_landmarker.task.",
+    )
+    parser.add_argument(
+        "--no-threaded",
+        action="store_true",
+        help="Disable threaded camera capture.",
     )
     return parser.parse_args()
 
@@ -100,6 +107,9 @@ def main() -> None:
                 "Unable to open camera. Try a different --camera-index."
             )
 
+    threaded = not args.no_threaded
+    capture = ThreadedCapture(cap).start() if threaded else None
+
     tracker = HandTracker(
         max_num_hands=args.max_hands,
         model_complexity=args.model_complexity,
@@ -116,9 +126,13 @@ def main() -> None:
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+            if capture is not None:
+                ok, frame, _frame_id = capture.read()
+            else:
+                ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.005)
+                continue
             if _is_black_frame(frame):
                 black_frames += 1
             else:
@@ -128,9 +142,17 @@ def main() -> None:
                 message = _black_frame_message(camera_index, args.backend)
                 print(message)
                 if args.auto_camera and camera_index < args.max_camera_index:
-                    cap.release()
                     camera_index += 1
+                    if capture is not None:
+                        capture.release()
+                        capture = None
+                    else:
+                        cap.release()
                     cap = _open_camera(camera_index, backend)
+                    if not cap.isOpened():
+                        raise RuntimeError(message)
+                    if threaded:
+                        capture = ThreadedCapture(cap).start()
                     black_frames = 0
                     continue
                 raise RuntimeError(message)
@@ -156,7 +178,7 @@ def main() -> None:
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                (0, 220, 0),
+                IOS_BLUE,
                 2,
             )
 
@@ -166,7 +188,10 @@ def main() -> None:
                 break
     finally:
         tracker.close()
-        cap.release()
+        if capture is not None:
+            capture.release()
+        else:
+            cap.release()
         cv2.destroyAllWindows()
 
 

@@ -26,3 +26,5 @@ venv/
 # Data
 outputs/
 models/
+
+.png
