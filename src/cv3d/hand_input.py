@@ -228,19 +228,29 @@ class HandInput:
     def _detect_gloves(
         self, frame
     ) -> Tuple[List[HandState], List[np.ndarray], List[Tuple[int, int]], np.ndarray]:
+        with self._lock:
+            glove_lower = self._glove_lower.copy()
+            glove_upper = self._glove_upper.copy()
+            glove_min_area = float(self._glove_min_area)
+            glove_kernel_size = int(self._glove_kernel_size)
+            glove_open = int(self._glove_open)
+            glove_close = int(self._glove_close)
+            glove_dilate = int(self._glove_dilate)
+            glove_contour_epsilon = float(self._glove_contour_epsilon)
+
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self._glove_lower, self._glove_upper)
-        kernel = np.ones((self._glove_kernel_size, self._glove_kernel_size), dtype=np.uint8)
-        if self._glove_open:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=self._glove_open)
-        if self._glove_close:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=self._glove_close)
-        if self._glove_dilate:
-            mask = cv2.dilate(mask, kernel, iterations=self._glove_dilate)
+        mask = cv2.inRange(hsv, glove_lower, glove_upper)
+        kernel = np.ones((glove_kernel_size, glove_kernel_size), dtype=np.uint8)
+        if glove_open:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=glove_open)
+        if glove_close:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=glove_close)
+        if glove_dilate:
+            mask = cv2.dilate(mask, kernel, iterations=glove_dilate)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         frame_area = frame.shape[0] * frame.shape[1]
-        min_area = max(self._glove_min_area, frame_area * 0.0006)
+        min_area = max(glove_min_area, frame_area * 0.0006)
         candidates = [c for c in contours if cv2.contourArea(c) >= min_area]
         candidates.sort(key=cv2.contourArea, reverse=True)
         candidates = candidates[: self._max_hands]
@@ -250,8 +260,8 @@ class HandInput:
         glove_centers: List[Tuple[int, int]] = []
         for contour in candidates:
             outline = contour
-            if self._glove_contour_epsilon > 0.0:
-                epsilon = self._glove_contour_epsilon * cv2.arcLength(contour, True)
+            if glove_contour_epsilon > 0.0:
+                epsilon = glove_contour_epsilon * cv2.arcLength(contour, True)
                 outline = cv2.approxPolyDP(contour, epsilon, True)
             moments = cv2.moments(outline)
             if moments["m00"] != 0:
@@ -430,6 +440,115 @@ class HandInput:
 
     def get_grip_ratio(self) -> float:
         return float(self._grip_ratio)
+
+    @staticmethod
+    def _clamp_glove_component(index: int, value: float) -> int:
+        max_value = 179 if index == 0 else 255
+        return int(max(0, min(max_value, int(round(value)))))
+
+    def _set_glove_component(self, index: int, value: float, lower: bool) -> None:
+        val = self._clamp_glove_component(index, value)
+        with self._lock:
+            if lower:
+                self._glove_lower[index] = np.uint8(val)
+                if self._glove_lower[index] > self._glove_upper[index]:
+                    self._glove_upper[index] = self._glove_lower[index]
+            else:
+                self._glove_upper[index] = np.uint8(val)
+                if self._glove_upper[index] < self._glove_lower[index]:
+                    self._glove_lower[index] = self._glove_upper[index]
+
+    def _get_glove_component(self, index: int, lower: bool) -> int:
+        with self._lock:
+            source = self._glove_lower if lower else self._glove_upper
+            return int(source[index])
+
+    def set_glove_h_low(self, value: float) -> None:
+        self._set_glove_component(0, value, lower=True)
+
+    def get_glove_h_low(self) -> int:
+        return self._get_glove_component(0, lower=True)
+
+    def set_glove_h_high(self, value: float) -> None:
+        self._set_glove_component(0, value, lower=False)
+
+    def get_glove_h_high(self) -> int:
+        return self._get_glove_component(0, lower=False)
+
+    def set_glove_s_low(self, value: float) -> None:
+        self._set_glove_component(1, value, lower=True)
+
+    def get_glove_s_low(self) -> int:
+        return self._get_glove_component(1, lower=True)
+
+    def set_glove_s_high(self, value: float) -> None:
+        self._set_glove_component(1, value, lower=False)
+
+    def get_glove_s_high(self) -> int:
+        return self._get_glove_component(1, lower=False)
+
+    def set_glove_v_low(self, value: float) -> None:
+        self._set_glove_component(2, value, lower=True)
+
+    def get_glove_v_low(self) -> int:
+        return self._get_glove_component(2, lower=True)
+
+    def set_glove_v_high(self, value: float) -> None:
+        self._set_glove_component(2, value, lower=False)
+
+    def get_glove_v_high(self) -> int:
+        return self._get_glove_component(2, lower=False)
+
+    def set_glove_min_area(self, value: float) -> None:
+        with self._lock:
+            self._glove_min_area = max(0.0, float(value))
+
+    def get_glove_min_area(self) -> float:
+        with self._lock:
+            return float(self._glove_min_area)
+
+    def set_glove_kernel_size(self, value: float) -> None:
+        size = max(1, int(round(value)))
+        if size % 2 == 0:
+            size += 1
+        with self._lock:
+            self._glove_kernel_size = size
+
+    def get_glove_kernel_size(self) -> int:
+        with self._lock:
+            return int(self._glove_kernel_size)
+
+    def set_glove_open(self, value: float) -> None:
+        with self._lock:
+            self._glove_open = max(0, int(round(value)))
+
+    def get_glove_open(self) -> int:
+        with self._lock:
+            return int(self._glove_open)
+
+    def set_glove_close(self, value: float) -> None:
+        with self._lock:
+            self._glove_close = max(0, int(round(value)))
+
+    def get_glove_close(self) -> int:
+        with self._lock:
+            return int(self._glove_close)
+
+    def set_glove_dilate(self, value: float) -> None:
+        with self._lock:
+            self._glove_dilate = max(0, int(round(value)))
+
+    def get_glove_dilate(self) -> int:
+        with self._lock:
+            return int(self._glove_dilate)
+
+    def set_glove_contour_epsilon(self, value: float) -> None:
+        with self._lock:
+            self._glove_contour_epsilon = max(0.0, float(value))
+
+    def get_glove_contour_epsilon(self) -> float:
+        with self._lock:
+            return float(self._glove_contour_epsilon)
 
     def _draw_stylized(self, frame, landmarks: List[Tuple[int, int]]) -> None:
         if not landmarks:

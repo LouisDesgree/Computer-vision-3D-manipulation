@@ -44,6 +44,7 @@ class HandMenu:
         width: int = 360,
         row_height: int = 44,
         padding: int = 16,
+        title: str = "Controls",
         open_hold: float = 1.0,
         toggle_cooldown: float = 1.0,
         open_strength_threshold: float = 0.35,
@@ -57,6 +58,7 @@ class HandMenu:
         self.width = int(width * scale)
         self.row_height = int(row_height * scale)
         self.padding = int(padding * scale)
+        self.title = title
         self.open_hold = open_hold
         self.toggle_cooldown = toggle_cooldown
         self.open_strength_threshold = max(0.1, open_strength_threshold)
@@ -250,7 +252,7 @@ class HandMenu:
         title_y = panel_y + int(24 * self._scale)
         draw_text(
             frame,
-            "Controls",
+            self.title,
             (panel_x + self.padding, title_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             max(0.55, 0.55 * self._scale),

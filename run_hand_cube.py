@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass
+import json
 import math
 import sys
 import time
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cv3d.cube_render import CubeRenderer
 from cv3d.data_logger import DataLogger, LoggerConfig
+from cv3d.fretboard import FretboardConfig, FretboardTracker, draw_fretboard
 from cv3d.gesture_model import GestureConfig, GestureTracker
 from cv3d.hand_input import HandInput
 from cv3d.hand_menu import HandMenu, MenuItem
@@ -42,6 +44,389 @@ def _parse_hsv(value: str) -> tuple[int, int, int]:
         return tuple(int(part) for part in parts)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("HSV values must be integers.") from exc
+
+
+def _settings_path(custom: Path | None) -> Path:
+    if custom is not None:
+        return custom.expanduser()
+    return Path.home() / ".cv3d" / "hand_cube_settings.json"
+
+
+def _load_settings(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: failed to read settings from {path}: {exc}")
+        return {}
+
+
+def _save_settings(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: failed to save settings to {path}: {exc}")
+
+
+def _apply_settings(
+    settings: dict,
+    hand_input: HandInput,
+    physics: CubePhysics,
+    objects: list["SceneObject"],
+    ui_flags: dict[str, bool],
+    mask_flags: dict[str, float | bool],
+    fretboard_tracker: FretboardTracker | None,
+    args: argparse.Namespace,
+) -> None:
+    controls = settings.get("controls", {})
+    gravity = controls.get("gravity")
+    if gravity is not None:
+        physics.config.gravity = max(0.0, float(gravity))
+    contact_force = controls.get("contact_force")
+    if contact_force is not None:
+        physics.config.contact_force = max(0.0, float(contact_force))
+    pinch_ratio = controls.get("pinch_ratio")
+    if pinch_ratio is not None:
+        hand_input.set_pinch_ratio(float(pinch_ratio))
+    grip_ratio = controls.get("grip_ratio")
+    if grip_ratio is not None:
+        hand_input.set_grip_ratio(float(grip_ratio))
+    cube_count = controls.get("cubes")
+    if cube_count is not None:
+        _set_cube_count(objects, float(cube_count), args.cube_size)
+    orb_count = controls.get("orbs")
+    if orb_count is not None:
+        _set_orb_count(objects, float(orb_count), args.orb_size, args.max_orbs)
+
+    ui = settings.get("ui", {})
+    for key in ("stats", "graphs", "manipulation", "mask_view"):
+        if key in ui:
+            ui_flags[key] = bool(ui[key])
+
+    mask = settings.get("mask", {})
+    hsv_lower = mask.get("hsv_lower")
+    hsv_upper = mask.get("hsv_upper")
+    if isinstance(hsv_lower, (list, tuple)) and len(hsv_lower) == 3:
+        hand_input.set_glove_h_low(hsv_lower[0])
+        hand_input.set_glove_s_low(hsv_lower[1])
+        hand_input.set_glove_v_low(hsv_lower[2])
+    if isinstance(hsv_upper, (list, tuple)) and len(hsv_upper) == 3:
+        hand_input.set_glove_h_high(hsv_upper[0])
+        hand_input.set_glove_s_high(hsv_upper[1])
+        hand_input.set_glove_v_high(hsv_upper[2])
+    min_area = mask.get("min_area")
+    if min_area is not None:
+        hand_input.set_glove_min_area(float(min_area))
+    kernel_size = mask.get("kernel_size")
+    if kernel_size is not None:
+        hand_input.set_glove_kernel_size(float(kernel_size))
+    morph_open = mask.get("open")
+    if morph_open is not None:
+        hand_input.set_glove_open(float(morph_open))
+    morph_close = mask.get("close")
+    if morph_close is not None:
+        hand_input.set_glove_close(float(morph_close))
+    morph_dilate = mask.get("dilate")
+    if morph_dilate is not None:
+        hand_input.set_glove_dilate(float(morph_dilate))
+    epsilon = mask.get("contour_epsilon")
+    if epsilon is not None:
+        hand_input.set_glove_contour_epsilon(float(epsilon))
+    hand_overlay = mask.get("hand_overlay")
+    if hand_overlay is None and "overlay" in mask:
+        hand_overlay = mask.get("overlay")
+    if hand_overlay is not None:
+        mask_flags["hand_overlay"] = bool(hand_overlay)
+    hand_window = mask.get("hand_window")
+    if hand_window is None and "window" in mask:
+        hand_window = mask.get("window")
+    if hand_window is not None:
+        mask_flags["hand_window"] = bool(hand_window)
+    for key in ("fret_overlay", "fret_window", "glove", "stylized"):
+        if key in mask:
+            mask_flags[key] = bool(mask[key])
+    alpha = mask.get("alpha")
+    if alpha is not None:
+        mask_flags["alpha"] = max(0.05, min(0.85, float(alpha)))
+
+    if fretboard_tracker is not None and args.fretboard_config is None:
+        fb = settings.get("fretboard_mask", {})
+        config = fretboard_tracker.config
+        use_color = fb.get("use_color")
+        if use_color is not None:
+            config.mask_use_color = bool(use_color)
+        use_depth = fb.get("use_depth")
+        if use_depth is not None:
+            config.mask_use_depth = bool(use_depth)
+        exclude_hands = fb.get("exclude_hands")
+        if exclude_hands is not None:
+            config.mask_exclude_hands = bool(exclude_hands)
+        color_lower = fb.get("color_lower")
+        color_upper = fb.get("color_upper")
+        if isinstance(color_lower, (list, tuple)) and len(color_lower) == 3:
+            config.mask_color_lower = tuple(int(v) for v in color_lower)
+        if isinstance(color_upper, (list, tuple)) and len(color_upper) == 3:
+            config.mask_color_upper = tuple(int(v) for v in color_upper)
+        for key, attr in (
+            ("color_open", "mask_color_open"),
+            ("color_close", "mask_color_close"),
+            ("color_dilate", "mask_color_dilate"),
+            ("depth_blur", "mask_depth_blur"),
+            ("depth_threshold", "mask_depth_threshold"),
+            ("depth_dilate", "mask_depth_dilate"),
+            ("hand_dilate", "mask_hand_dilate"),
+        ):
+            value = fb.get(key)
+            if value is not None:
+                try:
+                    setattr(config, attr, int(round(float(value))))
+                except (TypeError, ValueError):
+                    continue
+
+
+def _collect_settings(
+    hand_input: HandInput,
+    physics: CubePhysics,
+    objects: list["SceneObject"],
+    ui_flags: dict[str, bool],
+    mask_flags: dict[str, float | bool],
+    fretboard_tracker: FretboardTracker | None,
+) -> dict:
+    data = {
+        "version": 1,
+        "controls": {
+            "gravity": float(physics.config.gravity),
+            "contact_force": float(physics.config.contact_force),
+            "cubes": int(_count_objects(objects, "cube")),
+            "orbs": int(_count_objects(objects, "orb")),
+            "pinch_ratio": float(hand_input.get_pinch_ratio()),
+            "grip_ratio": float(hand_input.get_grip_ratio()),
+        },
+        "ui": {
+            "stats": bool(ui_flags.get("stats", False)),
+            "graphs": bool(ui_flags.get("graphs", False)),
+            "fretboard": bool(ui_flags.get("fretboard", False)),
+            "manipulation": bool(ui_flags.get("manipulation", True)),
+            "mask_view": bool(ui_flags.get("mask_view", False)),
+        },
+        "mask": {
+            "hsv_lower": [
+                int(hand_input.get_glove_h_low()),
+                int(hand_input.get_glove_s_low()),
+                int(hand_input.get_glove_v_low()),
+            ],
+            "hsv_upper": [
+                int(hand_input.get_glove_h_high()),
+                int(hand_input.get_glove_s_high()),
+                int(hand_input.get_glove_v_high()),
+            ],
+            "min_area": float(hand_input.get_glove_min_area()),
+            "kernel_size": int(hand_input.get_glove_kernel_size()),
+            "open": int(hand_input.get_glove_open()),
+            "close": int(hand_input.get_glove_close()),
+            "dilate": int(hand_input.get_glove_dilate()),
+            "contour_epsilon": float(hand_input.get_glove_contour_epsilon()),
+            "hand_overlay": bool(mask_flags.get("hand_overlay", False)),
+            "hand_window": bool(mask_flags.get("hand_window", False)),
+            "fret_overlay": bool(mask_flags.get("fret_overlay", False)),
+            "fret_window": bool(mask_flags.get("fret_window", False)),
+            "glove": bool(mask_flags.get("glove", True)),
+            "stylized": bool(mask_flags.get("stylized", False)),
+            "alpha": float(mask_flags.get("alpha", 0.35)),
+        },
+    }
+    if fretboard_tracker is not None:
+        config = fretboard_tracker.config
+        data["fretboard_mask"] = {
+            "use_color": bool(config.mask_use_color),
+            "use_depth": bool(config.mask_use_depth),
+            "exclude_hands": bool(config.mask_exclude_hands),
+            "color_lower": [
+                int(config.mask_color_lower[0]),
+                int(config.mask_color_lower[1]),
+                int(config.mask_color_lower[2]),
+            ],
+            "color_upper": [
+                int(config.mask_color_upper[0]),
+                int(config.mask_color_upper[1]),
+                int(config.mask_color_upper[2]),
+            ],
+            "color_open": int(config.mask_color_open),
+            "color_close": int(config.mask_color_close),
+            "color_dilate": int(config.mask_color_dilate),
+            "depth_blur": int(config.mask_depth_blur),
+            "depth_threshold": int(config.mask_depth_threshold),
+            "depth_dilate": int(config.mask_depth_dilate),
+            "hand_dilate": int(config.mask_hand_dilate),
+        }
+    return data
+
+
+def _dataset_path(custom: Path | None) -> Path:
+    if custom is not None:
+        return custom.expanduser()
+    return Path.home() / ".cv3d" / "fretboard_dataset"
+
+
+def _load_fretboard_overrides(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        print(f"Warning: failed to read fretboard config from {path}: {exc}")
+        return {}
+    except json.JSONDecodeError as exc:
+        print(f"Warning: invalid fretboard config JSON in {path}: {exc}")
+        return {}
+
+
+def _apply_fretboard_overrides(config: FretboardConfig, overrides: dict) -> None:
+    for key, value in overrides.items():
+        if not hasattr(config, key):
+            continue
+        current = getattr(config, key)
+        try:
+            if isinstance(current, bool):
+                cast_value = bool(value)
+            elif isinstance(current, int):
+                cast_value = int(round(float(value)))
+            elif isinstance(current, tuple) and isinstance(value, (list, tuple)):
+                cast_value = tuple(int(round(float(item))) for item in value)
+            else:
+                cast_value = float(value)
+        except (TypeError, ValueError):
+            continue
+        setattr(config, key, cast_value)
+
+
+def _next_sample_id(images_dir: Path) -> int:
+    if not images_dir.exists():
+        return 1
+    highest = 0
+    for path in images_dir.glob("*.jpg"):
+        if path.stem.isdigit():
+            highest = max(highest, int(path.stem))
+    for path in images_dir.glob("*.png"):
+        if path.stem.isdigit():
+            highest = max(highest, int(path.stem))
+    return highest + 1
+
+
+def _count_annotations(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        return sum(1 for _ in path.read_text(encoding="utf-8").splitlines() if _)
+    except OSError:
+        return 0
+
+
+def _order_quad(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if len(points) != 4:
+        return points
+    pts = np.array(points, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).flatten()
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+    return [(int(p[0]), int(p[1])) for p in ordered]
+
+
+def _run_fretboard_training(
+    cap: cv2.VideoCapture,
+    capture: ThreadedCapture | None,
+    args: argparse.Namespace,
+    fretboard_tracker: FretboardTracker,
+) -> None:
+    dataset_dir = _dataset_path(args.fretboard_dataset)
+    images_dir = dataset_dir / "images"
+    annotations_path = dataset_dir / "annotations.jsonl"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    sample_id = _next_sample_id(images_dir)
+    sample_count = _count_annotations(annotations_path)
+
+    points: list[tuple[int, int]] = []
+
+    def _on_mouse(event, x, y, _flags, _param) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if len(points) < 4:
+                points.append((int(x), int(y)))
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            if points:
+                points.pop()
+
+    window_name = "Fretboard Trainer"
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, _on_mouse)
+
+    while True:
+        if capture is not None:
+            ok, frame, _frame_id = capture.read()
+        else:
+            ok, frame = cap.read()
+        if not ok or frame is None:
+            time.sleep(0.005)
+            continue
+
+        if args.flip:
+            frame = cv2.flip(frame, 1)
+
+        display = frame.copy()
+        auto_result = fretboard_tracker.update(frame, time.time())
+        if auto_result is not None:
+            auto_poly = auto_result.polygon.astype(np.int32)
+            cv2.polylines(display, [auto_poly], True, IOS_BORDER, 1)
+
+        if points:
+            poly = np.array(points, dtype=np.int32)
+            cv2.polylines(display, [poly], len(points) == 4, IOS_BLUE, 2)
+            for pt in points:
+                cv2.circle(display, pt, 6, IOS_BLUE_SOFT, -1)
+
+        info_lines = [
+            "Training mode: click 4 corners of the fretboard.",
+            "Keys: [a] auto  [s] save  [c] clear  [u] undo  [q] quit",
+            f"Dataset: {dataset_dir}",
+            f"Samples: {sample_count}",
+        ]
+        _draw_stats(display, info_lines, anchor=(18, 18))
+        cv2.imshow(window_name, display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord("q")):
+            break
+        if key in (ord("u"), ord("z")) and points:
+            points.pop()
+        elif key == ord("c"):
+            points.clear()
+        elif key == ord("a"):
+            if auto_result is not None:
+                auto_pts = [(int(p[0]), int(p[1])) for p in auto_result.polygon]
+                points[:] = _order_quad(auto_pts)
+        elif key == ord("s"):
+            if len(points) == 4:
+                ordered = _order_quad(points)
+                image_name = f"{sample_id:06d}.jpg"
+                image_path = images_dir / image_name
+                cv2.imwrite(str(image_path), frame)
+                entry = {
+                    "image": f"images/{image_name}",
+                    "polygon": ordered,
+                    "timestamp": time.time(),
+                }
+                with annotations_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(entry) + "\n")
+                sample_id += 1
+                sample_count += 1
+                points.clear()
+
+    cv2.destroyWindow(window_name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,6 +523,34 @@ def parse_args() -> argparse.Namespace:
         help="Show the glove segmentation mask for tuning HSV bounds.",
     )
     parser.add_argument(
+        "--train-fretboard",
+        action="store_true",
+        help="Run the fretboard training capture UI (manual annotation).",
+    )
+    parser.add_argument(
+        "--fretboard-dataset",
+        type=Path,
+        default=None,
+        help="Directory to store fretboard training samples.",
+    )
+    parser.add_argument(
+        "--fretboard-config",
+        type=Path,
+        default=None,
+        help="Optional JSON file to override fretboard detection parameters.",
+    )
+    parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=None,
+        help="Optional path for settings JSON (default: ~/.cv3d/hand_cube_settings.json).",
+    )
+    parser.add_argument(
+        "--no-settings",
+        action="store_true",
+        help="Disable loading/saving settings across launches.",
+    )
+    parser.add_argument(
         "--log-dir",
         type=Path,
         default=None,
@@ -192,6 +605,158 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Minimum confidence required to show a gesture label.",
+    )
+    parser.add_argument(
+        "--show-fretboard",
+        action="store_true",
+        help="Overlay detected guitar fretboard and finger positions.",
+    )
+    parser.add_argument(
+        "--fretboard-scale",
+        type=float,
+        default=0.6,
+        help="Downscale factor for fretboard detection (0.3-1.0).",
+    )
+    parser.add_argument(
+        "--fretboard-canny-low",
+        type=int,
+        default=50,
+        help="Lower Canny threshold for fretboard edges.",
+    )
+    parser.add_argument(
+        "--fretboard-canny-high",
+        type=int,
+        default=140,
+        help="Upper Canny threshold for fretboard edges.",
+    )
+    parser.add_argument(
+        "--fretboard-min-area",
+        type=float,
+        default=0.03,
+        help="Minimum fretboard area ratio relative to the frame.",
+    )
+    parser.add_argument(
+        "--fretboard-min-aspect",
+        type=float,
+        default=3.0,
+        help="Minimum aspect ratio for the fretboard candidate.",
+    )
+    parser.add_argument(
+        "--fretboard-angle-tol",
+        type=float,
+        default=12.0,
+        help="Angle tolerance in degrees for string/fret lines.",
+    )
+    parser.add_argument(
+        "--fretboard-strings",
+        type=int,
+        default=6,
+        help="Expected number of strings on the fretboard.",
+    )
+    parser.add_argument(
+        "--fretboard-line-length",
+        type=int,
+        default=40,
+        help="Minimum line length for Hough line detection.",
+    )
+    parser.add_argument(
+        "--fretboard-line-gap",
+        type=int,
+        default=10,
+        help="Maximum line gap for Hough line detection.",
+    )
+    parser.add_argument(
+        "--fretboard-string-cluster",
+        type=float,
+        default=0.04,
+        help="String clustering tolerance as a fraction of board width.",
+    )
+    parser.add_argument(
+        "--fretboard-fret-cluster",
+        type=float,
+        default=0.025,
+        help="Fret clustering tolerance as a fraction of board length.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-color",
+        action="store_true",
+        help="Enable color mask for fretboard detection.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-color-low",
+        type=_parse_hsv,
+        default=(5, 30, 40),
+        help="HSV lower bound for fretboard color mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-color-high",
+        type=_parse_hsv,
+        default=(30, 255, 255),
+        help="HSV upper bound for fretboard color mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-color-open",
+        type=int,
+        default=0,
+        help="Open iterations for fretboard color mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-color-close",
+        type=int,
+        default=1,
+        help="Close iterations for fretboard color mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-color-dilate",
+        type=int,
+        default=1,
+        help="Dilate iterations for fretboard color mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-depth",
+        action="store_true",
+        help="Enable depth-like mask for fretboard detection.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-depth-blur",
+        type=int,
+        default=5,
+        help="Blur kernel size for depth-like mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-depth-threshold",
+        type=int,
+        default=18,
+        help="Threshold for depth-like mask edge strength.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-depth-dilate",
+        type=int,
+        default=1,
+        help="Dilate iterations for depth-like mask.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-exclude-hands",
+        action="store_true",
+        help="Exclude hand regions from fretboard detection.",
+    )
+    parser.add_argument(
+        "--fretboard-mask-hand-dilate",
+        type=int,
+        default=18,
+        help="Dilate iterations for the hand exclusion mask.",
+    )
+    parser.add_argument(
+        "--fretboard-smooth",
+        type=float,
+        default=0.5,
+        help="Smoothing factor for fretboard tracking (0-1).",
+    )
+    parser.add_argument(
+        "--fretboard-hold",
+        type=float,
+        default=0.7,
+        help="Seconds to keep the last fretboard if detection drops.",
     )
     parser.add_argument(
         "--no-threaded",
@@ -282,7 +847,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-cubes", type=int, default=3)
     parser.add_argument("--cube-size", type=float, default=0.7)
     parser.add_argument("--cube-distance", type=float, default=5.8)
-    parser.add_argument("--num-orbs", type=int, default=1)
+    parser.add_argument("--num-orbs", type=int, default=0)
     parser.add_argument("--orb-size", type=float, default=0.5)
     parser.add_argument("--max-orbs", type=int, default=6)
     parser.add_argument(
@@ -336,8 +901,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--power-spawn-cooldown",
         type=float,
-        default=0.9,
-        help="Cooldown between two-finger spawns.",
+        default=0.0,
+        help="Cooldown between two-finger spawns (0 disables).",
     )
     parser.add_argument(
         "--power-spawn-velocity",
@@ -589,6 +1154,17 @@ def _draw_gesture_labels(frame, hands, results, min_confidence: float) -> None:
         )
 
 
+def _apply_mask_overlay(frame, mask, color, alpha: float) -> None:
+    if mask is None:
+        return
+    alpha = max(0.0, min(1.0, float(alpha)))
+    if alpha <= 0.0:
+        return
+    overlay = frame.copy()
+    overlay[mask > 0] = color
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+
 PALM_INDICES = (0, 5, 9, 13, 17)
 
 
@@ -718,6 +1294,7 @@ def _apply_gesture_powers(
 ) -> None:
     if not gestures:
         return
+    spawn_enabled = config.spawn_cooldown > 0.0 and config.max_orbs > 0
     active_ids = set()
     spawn_requests = 0
     for hand in hands:
@@ -748,13 +1325,14 @@ def _apply_gesture_powers(
             )
             state["last_shockwave"] = now
 
-        if (
-            label == "two"
-            and prev_label != "two"
-            and now - float(state["last_spawn"]) > config.spawn_cooldown
-        ):
-            spawn_requests += 1
-            state["last_spawn"] = now
+        if spawn_enabled:
+            if (
+                label == "two"
+                and prev_label != "two"
+                and now - float(state["last_spawn"]) > config.spawn_cooldown
+            ):
+                spawn_requests += 1
+                state["last_spawn"] = now
 
         if label == "open":
             _apply_tractor(
@@ -786,7 +1364,7 @@ def _apply_gesture_powers(
                         dt,
                     )
 
-    if spawn_requests > 0:
+    if spawn_enabled and spawn_requests > 0:
         for _ in range(spawn_requests):
             if _count_objects(objects, "orb") >= config.max_orbs:
                 break
@@ -946,6 +1524,53 @@ def main() -> None:
 
     threaded = not args.no_threaded
 
+    fretboard_overrides = _load_fretboard_overrides(args.fretboard_config)
+    fretboard_config = FretboardConfig(
+        scale=args.fretboard_scale,
+        canny_low=args.fretboard_canny_low,
+        canny_high=args.fretboard_canny_high,
+        min_area_ratio=args.fretboard_min_area,
+        min_aspect=args.fretboard_min_aspect,
+        angle_tol=args.fretboard_angle_tol,
+        min_line_length=args.fretboard_line_length,
+        max_line_gap=args.fretboard_line_gap,
+        string_count=args.fretboard_strings,
+        string_cluster_ratio=args.fretboard_string_cluster,
+        fret_cluster_ratio=args.fretboard_fret_cluster,
+        smooth_alpha=args.fretboard_smooth,
+        hold_seconds=args.fretboard_hold,
+        mask_use_color=args.fretboard_mask_color,
+        mask_color_lower=args.fretboard_mask_color_low,
+        mask_color_upper=args.fretboard_mask_color_high,
+        mask_color_open=args.fretboard_mask_color_open,
+        mask_color_close=args.fretboard_mask_color_close,
+        mask_color_dilate=args.fretboard_mask_color_dilate,
+        mask_use_depth=args.fretboard_mask_depth,
+        mask_depth_blur=args.fretboard_mask_depth_blur,
+        mask_depth_threshold=args.fretboard_mask_depth_threshold,
+        mask_depth_dilate=args.fretboard_mask_depth_dilate,
+        mask_exclude_hands=args.fretboard_mask_exclude_hands,
+        mask_hand_dilate=args.fretboard_mask_hand_dilate,
+    )
+    if fretboard_overrides:
+        _apply_fretboard_overrides(fretboard_config, fretboard_overrides)
+    fretboard_tracker = FretboardTracker(fretboard_config)
+
+    capture = ThreadedCapture(cap).start() if threaded else None
+    if args.train_fretboard:
+        try:
+            _run_fretboard_training(cap, capture, args, fretboard_tracker)
+        finally:
+            if capture is not None:
+                capture.release()
+            else:
+                cap.release()
+            cv2.destroyAllWindows()
+        return
+
+    settings_path = _settings_path(args.settings_path)
+    settings = {} if args.no_settings else _load_settings(settings_path)
+
     hand_input = HandInput(
         max_hands=args.max_hands,
         min_detection_confidence=args.min_detection_confidence,
@@ -991,7 +1616,6 @@ def main() -> None:
             min_confidence=args.gesture_min_confidence,
         )
     )
-    capture = ThreadedCapture(cap).start() if threaded else None
     hand_worker = HandWorker(hand_input).start() if threaded and not args.no_hand_worker else None
     logger = None
     if args.log_dir is not None:
@@ -1016,12 +1640,46 @@ def main() -> None:
         args.orb_size,
     )
     clock_state = CubeState()
-    ui_flags = {"stats": False, "graphs": False}
+    ui_flags = {
+        "stats": False,
+        "graphs": False,
+        "fretboard": args.show_fretboard,
+        "manipulation": True,
+        "mask_view": False,
+        "mask_hsv": False,
+        "mask_morph": False,
+    }
+    mask_flags = {
+        "hand_overlay": False,
+        "hand_window": bool(args.show_mask),
+        "fret_overlay": False,
+        "fret_window": False,
+        "glove": True,
+        "stylized": False,
+        "alpha": 0.35,
+    }
+
+    if settings:
+        _apply_settings(
+            settings,
+            hand_input,
+            physics,
+            objects,
+            ui_flags,
+            mask_flags,
+            fretboard_tracker,
+            args,
+        )
+        if args.show_mask:
+            mask_flags["hand_window"] = True
+    ui_flags["fretboard"] = bool(args.show_fretboard)
     speed_history = deque(maxlen=120)
     menu_toggle_time = 0.0
     menu_hover = False
     fps_value = 0.0
     gesture_state: dict[int, dict[str, float | str]] = {}
+    hand_mask_window_open = False
+    fret_mask_window_open = False
     power_config = PowerConfig(
         shockwave_strength=args.power_shockwave,
         shockwave_radius=args.power_shockwave_radius,
@@ -1042,6 +1700,42 @@ def main() -> None:
 
     def _toggle_graphs() -> None:
         ui_flags["graphs"] = not ui_flags["graphs"]
+
+    def _toggle_fretboard() -> None:
+        ui_flags["fretboard"] = not ui_flags["fretboard"]
+
+    def _toggle_manipulation() -> None:
+        ui_flags["manipulation"] = not ui_flags["manipulation"]
+
+    def _toggle_mask_view() -> None:
+        ui_flags["mask_view"] = not ui_flags["mask_view"]
+        if not ui_flags["mask_view"]:
+            ui_flags["mask_hsv"] = False
+            ui_flags["mask_morph"] = False
+
+    def _toggle_mask_hsv() -> None:
+        ui_flags["mask_hsv"] = not ui_flags["mask_hsv"]
+
+    def _toggle_mask_morph() -> None:
+        ui_flags["mask_morph"] = not ui_flags["mask_morph"]
+
+    def _toggle_hand_overlay() -> None:
+        mask_flags["hand_overlay"] = not mask_flags["hand_overlay"]
+
+    def _toggle_hand_window() -> None:
+        mask_flags["hand_window"] = not mask_flags["hand_window"]
+
+    def _toggle_fret_overlay() -> None:
+        mask_flags["fret_overlay"] = not mask_flags["fret_overlay"]
+
+    def _toggle_fret_window() -> None:
+        mask_flags["fret_window"] = not mask_flags["fret_window"]
+
+    def _toggle_mask_glove() -> None:
+        mask_flags["glove"] = not mask_flags["glove"]
+
+    def _toggle_mask_stylized() -> None:
+        mask_flags["stylized"] = not mask_flags["stylized"]
 
     menu = HandMenu(
         [
@@ -1102,6 +1796,18 @@ def main() -> None:
                 "{:.2f}",
             ),
             MenuItem(
+                "Masks",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_mask_view,
+                state=lambda: ui_flags["mask_view"],
+            ),
+            MenuItem(
                 "Stats",
                 lambda: 0.0,
                 lambda _value: None,
@@ -1125,11 +1831,298 @@ def main() -> None:
                 on_press=_toggle_graphs,
                 state=lambda: ui_flags["graphs"],
             ),
+            MenuItem(
+                "Guitar",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_fretboard,
+                state=lambda: ui_flags["fretboard"],
+            ),
+            MenuItem(
+                "Manipulate",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_manipulation,
+                state=lambda: ui_flags["manipulation"],
+            ),
         ],
         open_hold=args.menu_open_hold,
         toggle_cooldown=1.0,
         open_strength_threshold=args.menu_open_strength,
         scale=args.menu_scale,
+        use_open_gesture=False,
+    )
+
+    mask_menu_scale = max(0.85, min(args.menu_scale * 0.7, 1.4))
+    mask_view_menu = HandMenu(
+        [
+            MenuItem(
+                "Hand Overlay",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_hand_overlay,
+                state=lambda: mask_flags["hand_overlay"],
+            ),
+            MenuItem(
+                "Hand Window",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_hand_window,
+                state=lambda: mask_flags["hand_window"],
+            ),
+            MenuItem(
+                "Hand Glove",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_mask_glove,
+                state=lambda: mask_flags["glove"],
+            ),
+            MenuItem(
+                "Hand Stylized",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_mask_stylized,
+                state=lambda: mask_flags["stylized"],
+            ),
+            MenuItem(
+                "Fret Overlay",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_fret_overlay,
+                state=lambda: mask_flags["fret_overlay"],
+            ),
+            MenuItem(
+                "Fret Window",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_fret_window,
+                state=lambda: mask_flags["fret_window"],
+            ),
+            MenuItem(
+                "Alpha",
+                lambda: float(mask_flags["alpha"]),
+                lambda value: mask_flags.__setitem__(
+                    "alpha", max(0.05, min(0.85, float(value)))
+                ),
+                0.05,
+                0.85,
+                0.05,
+                "{:.2f}",
+            ),
+            MenuItem(
+                "HSV Menu",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_mask_hsv,
+                state=lambda: ui_flags["mask_hsv"],
+            ),
+            MenuItem(
+                "Morph Menu",
+                lambda: 0.0,
+                lambda _value: None,
+                0.0,
+                1.0,
+                0.0,
+                "{:.0f}",
+                kind="button",
+                on_press=_toggle_mask_morph,
+                state=lambda: ui_flags["mask_morph"],
+            ),
+        ],
+        anchor=(24, 24),
+        width=300,
+        row_height=38,
+        padding=12,
+        title="Mask View",
+        scale=mask_menu_scale,
+        use_open_gesture=False,
+    )
+
+    mask_hsv_menu = HandMenu(
+        [
+            MenuItem(
+                "H low",
+                hand_input.get_glove_h_low,
+                hand_input.set_glove_h_low,
+                0.0,
+                179.0,
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "H high",
+                hand_input.get_glove_h_high,
+                hand_input.set_glove_h_high,
+                0.0,
+                179.0,
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "S low",
+                hand_input.get_glove_s_low,
+                hand_input.set_glove_s_low,
+                0.0,
+                255.0,
+                5.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "S high",
+                hand_input.get_glove_s_high,
+                hand_input.set_glove_s_high,
+                0.0,
+                255.0,
+                5.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "V low",
+                hand_input.get_glove_v_low,
+                hand_input.set_glove_v_low,
+                0.0,
+                255.0,
+                5.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "V high",
+                hand_input.get_glove_v_high,
+                hand_input.set_glove_v_high,
+                0.0,
+                255.0,
+                5.0,
+                "{:.0f}",
+                integer=True,
+            ),
+        ],
+        anchor=(24, 24),
+        width=280,
+        row_height=36,
+        padding=12,
+        title="Mask HSV",
+        scale=mask_menu_scale,
+        use_open_gesture=False,
+    )
+
+    mask_morph_menu = HandMenu(
+        [
+            MenuItem(
+                "Min area",
+                hand_input.get_glove_min_area,
+                hand_input.set_glove_min_area,
+                200.0,
+                8000.0,
+                100.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Kernel",
+                hand_input.get_glove_kernel_size,
+                hand_input.set_glove_kernel_size,
+                1.0,
+                15.0,
+                2.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Open",
+                hand_input.get_glove_open,
+                hand_input.set_glove_open,
+                0.0,
+                4.0,
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Close",
+                hand_input.get_glove_close,
+                hand_input.set_glove_close,
+                0.0,
+                4.0,
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Dilate",
+                hand_input.get_glove_dilate,
+                hand_input.set_glove_dilate,
+                0.0,
+                4.0,
+                1.0,
+                "{:.0f}",
+                integer=True,
+            ),
+            MenuItem(
+                "Epsilon",
+                hand_input.get_glove_contour_epsilon,
+                hand_input.set_glove_contour_epsilon,
+                0.0,
+                0.03,
+                0.002,
+                "{:.3f}",
+            ),
+        ],
+        anchor=(24, 24),
+        width=300,
+        row_height=36,
+        padding=12,
+        title="Mask Morph",
+        scale=mask_menu_scale,
         use_open_gesture=False,
     )
 
@@ -1204,6 +2197,36 @@ def main() -> None:
             )
             menu.handle_input(hands, frame.shape, now)
 
+            mask_view_menu.is_open = ui_flags["mask_view"]
+            mask_hsv_menu.is_open = ui_flags["mask_hsv"]
+            mask_morph_menu.is_open = ui_flags["mask_morph"]
+
+            anchor_x, anchor_y = 24, 24
+            if menu.is_open:
+                panel_x, panel_y, panel_w, _panel_h = menu._panel_rect(frame.shape)
+                anchor_x = panel_x + panel_w + 16
+                anchor_y = panel_y
+            mask_view_menu.anchor = [anchor_x, anchor_y]
+            if mask_view_menu.is_open:
+                panel_x, panel_y, panel_w, _panel_h = mask_view_menu._panel_rect(frame.shape)
+                anchor_x = panel_x + panel_w + 16
+                anchor_y = panel_y
+            mask_hsv_menu.anchor = [anchor_x, anchor_y]
+            if mask_hsv_menu.is_open:
+                panel_x, panel_y, panel_w, _panel_h = mask_hsv_menu._panel_rect(frame.shape)
+                anchor_x = panel_x + panel_w + 16
+                anchor_y = panel_y
+            mask_morph_menu.anchor = [anchor_x, anchor_y]
+
+            mask_view_menu.update(hands, now, frame.shape)
+            mask_hsv_menu.update(hands, now, frame.shape)
+            mask_morph_menu.update(hands, now, frame.shape)
+            mask_view_menu.handle_input(hands, frame.shape, now)
+            mask_hsv_menu.handle_input(hands, frame.shape, now)
+            mask_morph_menu.handle_input(hands, frame.shape, now)
+
+            interaction_hands = hands if ui_flags["manipulation"] else []
+
             current_count = max(1, len(objects))
             contact_any = False
             for idx, obj in enumerate(objects):
@@ -1224,7 +2247,7 @@ def main() -> None:
 
             _apply_gesture_powers(
                 objects,
-                hands,
+                interaction_hands,
                 gesture_results,
                 gesture_state,
                 now,
@@ -1264,7 +2287,7 @@ def main() -> None:
                     half_h = max(6.0, radius)
                     contact_radius = max(2.0, radius)
 
-                contact_infos = hand_input.contact_vectors(hands, state.position)
+                contact_infos = hand_input.contact_vectors(interaction_hands, state.position)
                 if contact_radius > 0:
                     inflated_infos = []
                     for info in contact_infos:
@@ -1275,7 +2298,7 @@ def main() -> None:
                             inflated_infos.append((distance - contact_radius, normal))
                     contact_infos = inflated_infos
 
-                contact = physics.step(state, hands, contact_infos, dt)
+                contact = physics.step(state, interaction_hands, contact_infos, dt)
                 contact_any = contact_any or contact
                 contact_flags.append(contact)
 
@@ -1348,12 +2371,42 @@ def main() -> None:
                 ) / len(objects)
                 speed_history.append(avg_speed)
 
-            mask = hand_input.stylized_mask(frame.shape)
-            if mask is not None:
-                frame[mask == 255] = base_frame[mask == 255]
+            stylized_mask = hand_input.stylized_mask(frame.shape)
+            if stylized_mask is not None:
+                frame[stylized_mask == 255] = base_frame[stylized_mask == 255]
+
+            glove_mask = hand_input.last_mask()
+            fret_mask = None
+            if mask_flags["fret_overlay"] or mask_flags["fret_window"]:
+                fret_mask = fretboard_tracker.build_mask(base_frame, hands)
+            if mask_flags["hand_overlay"]:
+                if mask_flags["glove"] and glove_mask is not None:
+                    _apply_mask_overlay(frame, glove_mask, IOS_BLUE, mask_flags["alpha"])
+                if mask_flags["stylized"] and stylized_mask is not None:
+                    _apply_mask_overlay(
+                        frame,
+                        stylized_mask,
+                        IOS_BLUE_SOFT,
+                        mask_flags["alpha"] * 0.85,
+                    )
+            if mask_flags["fret_overlay"] and fret_mask is not None:
+                _apply_mask_overlay(frame, fret_mask, IOS_BLUE_SOFT, mask_flags["alpha"])
+
+            fretboard_result = None
+            fretboard_placements = None
+            if ui_flags["fretboard"]:
+                fretboard_result = fretboard_tracker.update(base_frame, now, hands)
+                if fretboard_result is not None:
+                    fretboard_placements = fretboard_tracker.locate_fingers(
+                        hands, fretboard_result
+                    )
+                    draw_fretboard(frame, fretboard_result, fretboard_placements)
 
             hand_input.draw(frame)
             menu.draw(frame)
+            mask_view_menu.draw(frame)
+            mask_hsv_menu.draw(frame)
+            mask_morph_menu.draw(frame)
             _draw_top_bar(frame, menu.is_open, menu_hover)
             if args.show_gestures:
                 _draw_gesture_labels(
@@ -1367,7 +2420,7 @@ def main() -> None:
                 if args.log_mask:
                     log_mask = hand_input.last_mask()
                     if log_mask is None:
-                        log_mask = mask
+                        log_mask = stylized_mask
                     if log_mask is not None:
                         log_mask = log_mask.copy()
                 logger.log(
@@ -1378,6 +2431,8 @@ def main() -> None:
                     gestures=gesture_results,
                     cubes=objects,
                     contact_flags=contact_flags,
+                    fretboard=fretboard_result,
+                    finger_placements=fretboard_placements,
                     frame=base_frame if args.log_frames else None,
                     overlay=frame if args.log_overlay else None,
                     mask=log_mask,
@@ -1397,16 +2452,39 @@ def main() -> None:
                 _draw_graph(frame, list(speed_history), "Speed", anchor=(max(18, width - 280), max(220, height - 180)))
 
             cv2.imshow("Hand Cube", frame)
-            if args.show_mask and args.input_mode in ("blue-glove", "hybrid"):
-                mask = hand_input.last_mask()
-                if mask is not None:
-                    cv2.imshow("Glove Mask", mask)
+            if mask_flags["hand_window"]:
+                window_mask = None
+                if mask_flags["glove"] and glove_mask is not None:
+                    window_mask = glove_mask.copy()
+                if mask_flags["stylized"] and stylized_mask is not None:
+                    if window_mask is None:
+                        window_mask = stylized_mask.copy()
+                    else:
+                        window_mask = np.maximum(window_mask, stylized_mask)
+                if window_mask is not None:
+                    cv2.imshow("Hand Mask", window_mask)
+                    hand_mask_window_open = True
+            elif hand_mask_window_open:
+                cv2.destroyWindow("Hand Mask")
+                hand_mask_window_open = False
+            if mask_flags["fret_window"]:
+                if fret_mask is not None:
+                    cv2.imshow("Fretboard Mask", fret_mask)
+                    fret_mask_window_open = True
+            elif fret_mask_window_open:
+                cv2.destroyWindow("Fretboard Mask")
+                fret_mask_window_open = False
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
     finally:
         if hand_worker is not None:
             hand_worker.stop()
+        if not args.no_settings:
+            settings = _collect_settings(
+                hand_input, physics, objects, ui_flags, mask_flags, fretboard_tracker
+            )
+            _save_settings(settings_path, settings)
         hand_input.close()
         if capture is not None:
             capture.release()

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .gesture_model import GestureResult
     from .hand_input import HandState
     from .physics import CubeState
+    from .fretboard import FingerPlacement, FretboardResult
 
 
 @dataclass
@@ -76,6 +77,8 @@ class DataLogger:
         gestures: Optional[Dict[int, "GestureResult"]],
         cubes: Iterable["CubeState"],
         contact_flags: Optional[List[bool]],
+        fretboard: Optional["FretboardResult"] = None,
+        finger_placements: Optional[Iterable["FingerPlacement"]] = None,
         frame: Optional["np.ndarray"] = None,
         overlay: Optional["np.ndarray"] = None,
         mask: Optional["np.ndarray"] = None,
@@ -92,6 +95,10 @@ class DataLogger:
             "cubes": [_cube_to_dict(cube) for cube in cubes],
             "contact_flags": list(contact_flags) if contact_flags is not None else None,
         }
+        if fretboard is not None:
+            item["fretboard"] = _fretboard_to_dict(fretboard)
+        if finger_placements is not None:
+            item["finger_placements"] = _finger_placements_to_dict(finger_placements)
         if frame is not None and self.config.record_frames:
             item["frame"] = frame
         if overlay is not None and self.config.record_overlay:
@@ -180,6 +187,40 @@ def _cube_to_dict(cube: "CubeState") -> Dict[str, Any]:
     if size is not None:
         data["size"] = float(size)
     return data
+
+
+def _fretboard_to_dict(result: "FretboardResult") -> Dict[str, Any]:
+    polygon = [[float(x), float(y)] for x, y in result.polygon.tolist()]
+    return {
+        "polygon": polygon,
+        "origin": [float(result.origin[0]), float(result.origin[1])],
+        "length_dir": [float(result.length_dir[0]), float(result.length_dir[1])],
+        "width_dir": [float(result.width_dir[0]), float(result.width_dir[1])],
+        "length": float(result.length),
+        "width": float(result.width),
+        "string_positions": [float(val) for val in result.string_positions],
+        "fret_positions": [float(val) for val in result.fret_positions],
+        "fret_positions_from_nut": [float(val) for val in result.fret_positions_from_nut],
+        "origin_is_nut": bool(result.origin_is_nut),
+    }
+
+
+def _finger_placements_to_dict(
+    placements: Iterable["FingerPlacement"],
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": placement.name,
+            "point": [int(placement.point[0]), int(placement.point[1])],
+            "string_index": int(placement.string_index)
+            if placement.string_index is not None
+            else None,
+            "fret_index": int(placement.fret_index)
+            if placement.fret_index is not None
+            else None,
+        }
+        for placement in placements
+    ]
 
 
 def _json_safe(value: Any) -> Any:

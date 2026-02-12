@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Highest camera index to probe with --auto-camera.",
     )
-    parser.add_argument("--max-hands", type=int, default=1)
+    parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--model-complexity", type=int, default=1)
     parser.add_argument("--min-detection-confidence", type=float, default=0.5)
     parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
@@ -50,6 +50,24 @@ def parse_args() -> argparse.Namespace:
         "--no-threaded",
         action="store_true",
         help="Disable threaded camera capture.",
+    )
+    parser.add_argument(
+        "--window-scale",
+        type=float,
+        default=1.25,
+        help="Scale factor for the display window (use <1.0 to shrink, >1.0 to zoom).",
+    )
+    parser.add_argument(
+        "--line-thickness",
+        type=int,
+        default=4,
+        help="Thickness for hand connection lines.",
+    )
+    parser.add_argument(
+        "--dot-radius",
+        type=int,
+        default=6,
+        help="Radius for landmark dots.",
     )
     return parser.parse_args()
 
@@ -125,6 +143,7 @@ def main() -> None:
     max_black_frames = 60
 
     try:
+        cv2.namedWindow("Hand Tracking", cv2.WINDOW_NORMAL)
         while True:
             if capture is not None:
                 ok, frame, _frame_id = capture.read()
@@ -161,7 +180,7 @@ def main() -> None:
                 frame = cv2.flip(frame, 1)
 
             results = tracker.process(frame)
-            tracker.draw(frame, results)
+            tracker.draw(frame, results, args.line_thickness, args.dot_radius)
 
             frame_count += 1
             now = time.time()
@@ -182,7 +201,16 @@ def main() -> None:
                 2,
             )
 
-            cv2.imshow("Hand Tracking", frame)
+            display_frame = frame
+            if args.window_scale != 1.0:
+                display_frame = cv2.resize(
+                    frame,
+                    (0, 0),
+                    fx=args.window_scale,
+                    fy=args.window_scale,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            cv2.imshow("Hand Tracking", display_frame)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break

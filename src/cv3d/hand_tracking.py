@@ -86,7 +86,7 @@ class HandTracker:
 
         return outputs
 
-    def draw(self, frame_bgr, results: List[HandTrackingResult]) -> None:
+    def draw(self, frame_bgr, results: List[HandTrackingResult], line_thickness: int = 2, dot_radius: int = 3) -> None:
         for result in results:
             if len(result.landmarks_2d) < 21:
                 continue
@@ -96,10 +96,10 @@ class HandTracker:
                     result.landmarks_2d[start_idx],
                     result.landmarks_2d[end_idx],
                     IOS_BLUE,
-                    2,
+                    line_thickness,
                 )
             for point in result.landmarks_2d:
-                cv2.circle(frame_bgr, point, 3, IOS_KNOB, -1)
+                cv2.circle(frame_bgr, point, dot_radius, IOS_KNOB, -1)
 
     def close(self) -> None:
         self._landmarker.close()

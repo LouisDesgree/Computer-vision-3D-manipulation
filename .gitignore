@@ -28,3 +28,7 @@ outputs/
 models/
 
 .png
+.
+logs/
+datasets/
+old/
