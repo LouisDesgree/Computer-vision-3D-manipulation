@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   cv3d:
     build:
@@ -32,7 +30,8 @@ services:
     
     # Sur Mac, utiliser le backend AVFoundation avec auto-camera
     # Le backend AVFoundation accède directement à la caméra macOS sans /dev/video0
-    command: python run_hand_cube.py --flip --backend avfoundation --auto-camera
+    # Note: Le script docker-entrypoint.sh ajoute déjà "python", donc on ne met que les arguments
+    command: run_hand_cube.py --flip --backend avfoundation --auto-camera
     
     stdin_open: true
     tty: true
