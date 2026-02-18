@@ -30,7 +30,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Installer les dépendances Python
-RUN pip install --no-cache-dir --upgrade pip && \
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copier le code source
@@ -56,4 +56,5 @@ ENV FONTCONFIG_PATH=/etc/fonts
 
 # Utiliser le script d'entrée qui configure tout automatiquement
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# CMD sera traité par docker-entrypoint.sh qui ajoute "python" automatiquement
 CMD ["run_hand_cube.py", "--flip"]
