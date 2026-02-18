@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  cv3d:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: computer-vision-3d
+    image: cv3d:latest
+    
+    # Accès à la caméra (Mac)
+    devices:
+      - /dev/video0:/dev/video0
+    
+    # Variables d'environnement pour l'affichage
+    environment:
+      - DISPLAY=host.docker.internal:0
+      - QT_X11_NO_MITSHM=1
+      - PYTHONUNBUFFERED=1
+      - LIBGL_ALWAYS_INDIRECT=1
+      - MESA_GL_VERSION_OVERRIDE=3.3
+      - MESA_GLSL_VERSION_OVERRIDE=330
+      - QT_QPA_FONTDIR=/usr/share/fonts
+      - FONTCONFIG_PATH=/etc/fonts
+    
+    # Volumes
+    volumes:
+      - ./models:/app/models
+      - ~/.cv3d:/root/.cv3d
+    
+    # Sur Mac, utiliser le backend AVFoundation
+    command: python run_hand_cube.py --flip --backend avfoundation --camera-index 0
+    
+    stdin_open: true
+    tty: true

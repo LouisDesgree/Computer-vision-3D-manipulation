@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  cv3d:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: computer-vision-3d
+    image: cv3d:latest
+    
+    # Accès aux périphériques (caméra)
+    # Le script docker-entrypoint.sh détecte automatiquement la caméra disponible
+    # Configurez usbipd-win pour que /dev/video0 soit disponible dans WSL2
+    devices:
+      - /dev/video0:/dev/video0
+    
+    # Variables d'environnement pour l'affichage
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - PYTHONUNBUFFERED=1
+      - LIBGL_ALWAYS_INDIRECT=1
+      - MESA_GL_VERSION_OVERRIDE=3.3
+      - MESA_GLSL_VERSION_OVERRIDE=330
+    
+    # Volumes pour partager X11 et les données
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./models:/app/models
+      - ${HOME}/.cv3d:/root/.cv3d
+    
+    # Permissions réseau (nécessaire pour X11 sur certains systèmes)
+    network_mode: host
+    
+    # Options de sécurité
+    privileged: false
+    shm_size: '1gb'  # Augmenté pour éviter les problèmes d'affichage
+    
+    # Le script docker-entrypoint.sh détecte automatiquement la caméra
+    # Pas besoin de spécifier --camera-index ou --auto-camera
+    # Il utilisera --auto-camera si /dev/video0 n'est pas disponible
+    
+    # Redémarrer en cas d'échec
+    restart: unless-stopped
+    
+    # TTY et stdin pour interaction
+    stdin_open: true
+    tty: true
