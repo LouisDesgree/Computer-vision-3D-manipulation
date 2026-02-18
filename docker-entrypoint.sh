@@ -17,7 +17,8 @@ if [ -z "$DISPLAY" ]; then
     fi
 fi
 
-# Vérifier si /dev/video0 existe
+# Vérifier si /dev/video0 existe (Linux/Windows)
+# Sur Mac, on utilise AVFoundation qui n'a pas besoin de /dev/video0
 CAMERA_INDEX="auto"
 if [ -e /dev/video0 ]; then
     echo "✅ Caméra détectée: /dev/video0"
@@ -29,13 +30,10 @@ elif [ -e /dev/video2 ]; then
     echo "✅ Caméra détectée: /dev/video2"
     CAMERA_INDEX=2
 else
-    echo "❌ ERREUR: Aucune caméra détectée dans /dev/video*"
-    echo "   → Pour activer la caméra, configurez usbipd-win :"
-    echo "     1. Installez: winget install dorssel.usbipd-win"
-    echo "     2. Partagez: usbipd bind --busid 1-1 (PowerShell admin)"
-    echo "     3. Attachez: ./attach-camera.sh 1-1 (dans WSL)"
-    echo ""
-    echo "   → Utilisation de --auto-camera en dernier recours..."
+    # Sur Mac ou si /dev/video0 n'existe pas, utiliser auto-camera
+    # Le backend AVFoundation sur Mac accède directement à la caméra
+    echo "⚠️  Aucune caméra détectée dans /dev/video*"
+    echo "   → Utilisation de --auto-camera (fonctionne avec AVFoundation sur Mac)"
     CAMERA_INDEX="auto"
 fi
 

@@ -8,9 +8,11 @@ services:
     container_name: computer-vision-3d
     image: cv3d:latest
     
-    # Accès à la caméra (Mac)
-    devices:
-      - /dev/video0:/dev/video0
+    # Sur Mac, les caméras ne sont pas accessibles via /dev/video0
+    # On utilise le backend AVFoundation d'OpenCV qui accède directement à la caméra macOS
+    # Pas besoin de devices pour la caméra sur Mac
+    # devices:
+    #   - /dev/video0:/dev/video0
     
     # Variables d'environnement pour l'affichage
     environment:
@@ -28,8 +30,9 @@ services:
       - ./models:/app/models
       - ~/.cv3d:/root/.cv3d
     
-    # Sur Mac, utiliser le backend AVFoundation
-    command: python run_hand_cube.py --flip --backend avfoundation --camera-index 0
+    # Sur Mac, utiliser le backend AVFoundation avec auto-camera
+    # Le backend AVFoundation accède directement à la caméra macOS sans /dev/video0
+    command: python run_hand_cube.py --flip --backend avfoundation --auto-camera
     
     stdin_open: true
     tty: true
