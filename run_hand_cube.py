@@ -1295,6 +1295,68 @@ def _spawn_orb(
     return True
 
 
+def _check_paddle_collision(
+    cube_pos: tuple[float, float],
+    cube_half_w: float,
+    cube_half_h: float,
+    paddle_rect: tuple[int, int, int, int],
+) -> bool:
+    """Vérifie si un cube entre en collision avec un paddle."""
+    x1, y1, x2, y2 = paddle_rect
+    cube_x, cube_y = cube_pos
+    
+    # Vérifier si le cube chevauche le paddle
+    if cube_x - cube_half_w <= x2 and cube_x + cube_half_w >= x1:
+        if cube_y - cube_half_h <= y2 and cube_y + cube_half_h >= y1:
+            return True
+    return False
+
+
+def _apply_wall_attraction(
+    state: CubeState,
+    left_rect: tuple[int, int, int, int],
+    right_rect: tuple[int, int, int, int],
+    width: int,
+    attraction_strength: float,
+    dt: float,
+) -> None:
+    """Applique une force d'attraction vers les murs (paddles)."""
+    if state.position is None:
+        return
+    
+    cube_x, cube_y = state.position
+    
+    # Déterminer vers quel mur attirer (gauche ou droite)
+    if cube_x < width / 2:
+        # Attirer vers le mur gauche
+        x1, y1, x2, y2 = left_rect
+        target_x = x2 + 20  # Position juste à droite du paddle gauche
+        target_y = (y1 + y2) / 2  # Centre vertical du paddle
+    else:
+        # Attirer vers le mur droit
+        x1, y1, x2, y2 = right_rect
+        target_x = x1 - 20  # Position juste à gauche du paddle droit
+        target_y = (y1 + y2) / 2  # Centre vertical du paddle
+    
+    # Calculer la direction vers le mur
+    dx = target_x - cube_x
+    dy = target_y - cube_y
+    dist = math.hypot(dx, dy)
+    
+    if dist > 1.0:
+        # Normaliser et appliquer la force d'attraction
+        nx = dx / dist
+        ny = dy / dist
+        # La force diminue avec la distance
+        force_scale = 1.0 / (1.0 + dist / 200.0)
+        impulse = attraction_strength * force_scale * dt
+        
+        vel_x, vel_y = state.velocity
+        vel_x += nx * impulse
+        vel_y += ny * impulse
+        state.velocity = (vel_x, vel_y)
+
+
 def _apply_gesture_powers(
     objects: list[SceneObject],
     hands,
@@ -1658,6 +1720,8 @@ def main() -> None:
     )
     paddle_centers: dict[str, float | None] = {"left": None, "right": None}
     clock_state = CubeState()
+    score = 0
+    last_paddle_hit: dict[int, float] = {}  # Track last hit time per cube to avoid spam
     ui_flags = {
         "stats": False,
         "graphs": False,
@@ -2387,13 +2451,18 @@ def main() -> None:
                     half_w = max(6.0, radius)
                     half_h = max(6.0, radius)
                 physics.apply_bounds(state, width, height, half_w, half_h)
+                
+                # Appliquer l'attraction vers les murs pour les cubes
+                if obj.kind == "cube":
+                    _apply_wall_attraction(state, left_rect, right_rect, width, 800.0, dt)
+                
                 radii.append(max(half_w, half_h))
                 object_states.append(state)
 
             if len(object_states) > 1:
                 _resolve_cube_collisions(object_states, radii, physics.config.restitution)
 
-            for obj, contact in zip(objects, contact_flags):
+            for idx, (obj, contact) in enumerate(zip(objects, contact_flags)):
                 state = obj.state
                 if state.position is None:
                     continue
@@ -2417,6 +2486,20 @@ def main() -> None:
                         state.scale,
                     )
                     side_color = CUBE_RED if state.position[0] > divider_x else CUBE_BLUE
+                    
+                    # Vérifier la collision avec les paddles pour le score
+                    hit_left = _check_paddle_collision(
+                        state.position, half_w, half_h, left_rect
+                    )
+                    hit_right = _check_paddle_collision(
+                        state.position, half_w, half_h, right_rect
+                    )
+                    
+                    # Éviter le spam de score (cooldown de 0.5 secondes)
+                    if (hit_left or hit_right) and (idx not in last_paddle_hit or now - last_paddle_hit[idx] > 0.5):
+                        score += 10
+                        last_paddle_hit[idx] = now
+                    
                     renderer.draw(
                         frame,
                         projected,
@@ -2482,6 +2565,20 @@ def main() -> None:
             mask_hsv_menu.draw(frame)
             mask_morph_menu.draw(frame)
             _draw_top_bar(frame, menu.is_open, menu_hover)
+            
+            # Afficher le score
+            score_text = f"Score: {score}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.8
+            thickness = 2
+            text_size = cv2.getTextSize(score_text, font, font_scale, thickness)[0]
+            text_x = width // 2 - text_size[0] // 2
+            text_y = 40
+            # Ombre du texte
+            cv2.putText(frame, score_text, (text_x + 2, text_y + 2), font, font_scale, (0, 0, 0), thickness + 1)
+            # Texte principal
+            cv2.putText(frame, score_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+            
             if args.show_gestures:
                 _draw_gesture_labels(
                     frame,
