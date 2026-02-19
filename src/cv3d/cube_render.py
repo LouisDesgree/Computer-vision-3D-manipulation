@@ -131,10 +131,11 @@ class CubeRenderer:
         projected: List[Tuple[int, int]],
         rotated: List[Tuple[float, float, float]],
         highlight: bool,
+        accent_color: tuple[int, int, int] | None = None,
     ) -> None:
         light_dir = _normalize((0.6, 0.9, 0.4))
         view_dir = (0.0, 0.0, 1.0)
-        accent = IOS_BLUE_SOFT
+        accent = accent_color or IOS_BLUE_SOFT
         face_depths = []
         for face_indices, base_color in FACES:
             verts = [rotated[idx] for idx in face_indices]
@@ -181,8 +182,8 @@ class CubeRenderer:
             pts = [projected[idx] for idx in face_indices]
             cv2.fillConvexPoly(frame, _to_poly(pts), shade)
 
-        edge_outer = IOS_BLUE_SOFT
-        edge_inner = IOS_BLUE
+        edge_outer = accent
+        edge_inner = accent_color or IOS_BLUE
         outer_thickness = 3
         inner_thickness = 1
         if highlight:

@@ -25,10 +25,13 @@ from cv3d.hand_input import HandInput
 from cv3d.hand_menu import HandMenu, MenuItem
 from cv3d.orb_render import OrbRenderer
 from cv3d.palette import (
+    CUBE_BLUE,
+    CUBE_RED,
+    IOS_BORDER,
     IOS_BLUE,
     IOS_BLUE_SOFT,
-    IOS_BORDER,
     IOS_GLASS,
+    IOS_SEPARATOR,
     IOS_TEXT,
 )
 from cv3d.pipeline import HandWorker, ThreadedCapture
@@ -184,6 +187,16 @@ def _apply_settings(
                     setattr(config, attr, int(round(float(value))))
                 except (TypeError, ValueError):
                     continue
+
+
+def _clamp_value(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _smooth_value(current: float | None, target: float, alpha: float = 0.25) -> float:
+    if current is None:
+        return target
+    return current + (target - current) * alpha
 
 
 def _collect_settings(
@@ -844,7 +857,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-speed", type=float, default=1400.0)
     parser.add_argument("--rotation-smoothing", type=float, default=0.2)
     parser.add_argument("--spin-strength", type=float, default=0.2)
-    parser.add_argument("--num-cubes", type=int, default=3)
+    parser.add_argument("--num-cubes", type=int, default=1)
     parser.add_argument("--cube-size", type=float, default=0.7)
     parser.add_argument("--cube-distance", type=float, default=5.8)
     parser.add_argument("--num-orbs", type=int, default=0)
@@ -1509,6 +1522,10 @@ def _handle_menu_button(
 def main() -> None:
     args = parse_args()
 
+    window_name = "Hand Cube"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 720)
+
     backend = _backend_from_name(args.backend)
     cap = _open_camera(args.camera_index, backend)
     camera_index = args.camera_index
@@ -1639,6 +1656,7 @@ def main() -> None:
         max(0, min(args.num_orbs, args.max_orbs)),
         args.orb_size,
     )
+    paddle_centers: dict[str, float | None] = {"left": None, "right": None}
     clock_state = CubeState()
     ui_flags = {
         "stats": False,
@@ -2163,6 +2181,8 @@ def main() -> None:
 
             height, width = frame.shape[:2]
             focal_length = width * 0.9
+            divider_x = width // 2
+            cv2.line(frame, (divider_x, 0), (divider_x, height), IOS_SEPARATOR, 2)
 
             if _is_black_frame(frame):
                 black_frames += 1
@@ -2224,6 +2244,53 @@ def main() -> None:
             mask_view_menu.handle_input(hands, frame.shape, now)
             mask_hsv_menu.handle_input(hands, frame.shape, now)
             mask_morph_menu.handle_input(hands, frame.shape, now)
+
+            paddle_height = max(60, int(height * 0.18))
+            paddle_width = max(12, int(width * 0.02))
+            paddle_margin = int(max(24, width * 0.06))
+            if paddle_centers["left"] is None:
+                paddle_centers["left"] = height * 0.5
+                paddle_centers["right"] = height * 0.5
+            left_candidates = [
+                center[1]
+                for hand in hands
+                if (center := getattr(hand, "center", None)) is not None and center[0] < divider_x
+            ]
+            right_candidates = [
+                center[1]
+                for hand in hands
+                if (center := getattr(hand, "center", None)) is not None and center[0] >= divider_x
+            ]
+            left_target = (
+                sum(left_candidates) / len(left_candidates)
+                if left_candidates
+                else (paddle_centers["left"] or height * 0.5)
+            )
+            right_target = (
+                sum(right_candidates) / len(right_candidates)
+                if right_candidates
+                else (paddle_centers["right"] or height * 0.5)
+            )
+            new_left = _smooth_value(paddle_centers["left"], left_target, 0.25)
+            new_right = _smooth_value(paddle_centers["right"], right_target, 0.25)
+            paddle_centers["left"] = _clamp_value(new_left, paddle_height, height - paddle_height)
+            paddle_centers["right"] = _clamp_value(new_right, paddle_height, height - paddle_height)
+            left_rect = (
+                int(paddle_margin - paddle_width // 2),
+                int(_clamp_value(paddle_centers["left"] - paddle_height, 0, height)),
+                int(paddle_margin + paddle_width // 2),
+                int(_clamp_value(paddle_centers["left"] + paddle_height, 0, height)),
+            )
+            right_rect = (
+                int(width - paddle_margin - paddle_width // 2),
+                int(_clamp_value(paddle_centers["right"] - paddle_height, 0, height)),
+                int(width - paddle_margin + paddle_width // 2),
+                int(_clamp_value(paddle_centers["right"] + paddle_height, 0, height)),
+            )
+            for rect, color in ((left_rect, CUBE_BLUE), (right_rect, CUBE_RED)):
+                x1, y1, x2, y2 = rect
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), IOS_BORDER, 2)
 
             interaction_hands = hands if ui_flags["manipulation"] else []
 
@@ -2349,7 +2416,14 @@ def main() -> None:
                         focal_length,
                         state.scale,
                     )
-                    renderer.draw(frame, projected, rotated, contact)
+                    side_color = CUBE_RED if state.position[0] > divider_x else CUBE_BLUE
+                    renderer.draw(
+                        frame,
+                        projected,
+                        rotated,
+                        contact,
+                        accent_color=side_color,
+                    )
                 else:
                     radius = orb_renderer.radius(
                         focal_length, obj.size, _avg_scale(state.scale)
@@ -2451,7 +2525,7 @@ def main() -> None:
             if ui_flags["graphs"]:
                 _draw_graph(frame, list(speed_history), "Speed", anchor=(max(18, width - 280), max(220, height - 180)))
 
-            cv2.imshow("Hand Cube", frame)
+            cv2.imshow(window_name, frame)
             if mask_flags["hand_window"]:
                 window_mask = None
                 if mask_flags["glove"] and glove_mask is not None:

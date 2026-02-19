@@ -7,10 +7,8 @@ from typing import Any, List, Optional, Tuple
 import urllib.request
 
 import cv2
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.vision.core.image import Image
-from mediapipe.tasks.python.vision.core.image import ImageFormat
+from mediapipe import Image, ImageFormat
+from mediapipe.tasks.python import BaseOptions, vision
 
 from .palette import IOS_BLUE, IOS_KNOB
 
