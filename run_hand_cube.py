@@ -96,13 +96,6 @@ def _apply_settings(
     grip_ratio = controls.get("grip_ratio")
     if grip_ratio is not None:
         hand_input.set_grip_ratio(float(grip_ratio))
-    cube_count = controls.get("cubes")
-    if cube_count is not None:
-        _set_cube_count(objects, float(cube_count), args.cube_size)
-    orb_count = controls.get("orbs")
-    if orb_count is not None:
-        _set_orb_count(objects, float(orb_count), args.orb_size, args.max_orbs)
-
     ui = settings.get("ui", {})
     for key in ("stats", "graphs", "manipulation", "mask_view"):
         if key in ui:
@@ -212,8 +205,6 @@ def _collect_settings(
         "controls": {
             "gravity": float(physics.config.gravity),
             "contact_force": float(physics.config.contact_force),
-            "cubes": int(_count_objects(objects, "cube")),
-            "orbs": int(_count_objects(objects, "orb")),
             "pinch_ratio": float(hand_input.get_pinch_ratio()),
             "grip_ratio": float(hand_input.get_grip_ratio()),
         },
@@ -1312,6 +1303,36 @@ def _check_paddle_collision(
     return False
 
 
+def _apply_paddle_bounce(
+    state: CubeState,
+    paddle_rect: tuple[int, int, int, int],
+    side: str,
+    cube_half_w: float,
+) -> None:
+    if state.position is None:
+        return
+    pos_x, pos_y = state.position
+    vel_x, vel_y = state.velocity
+    x1, y1, x2, y2 = paddle_rect
+
+    if side == "left":
+        pos_x = max(pos_x, x2 + cube_half_w + 1.0)
+        vel_x = max(260.0, abs(vel_x) * 0.95 + 140.0)
+    else:
+        pos_x = min(pos_x, x1 - cube_half_w - 1.0)
+        vel_x = -max(260.0, abs(vel_x) * 0.95 + 140.0)
+
+    # Add vertical deflection based on impact offset from paddle center.
+    paddle_center_y = (y1 + y2) / 2.0
+    half_height = max(1.0, (y2 - y1) / 2.0)
+    offset = _clamp_value((pos_y - paddle_center_y) / half_height, -1.0, 1.0)
+    vel_y += offset * 300.0
+
+    state.position = (pos_x, pos_y)
+    state.velocity = (vel_x, vel_y)
+    state.yaw_target += offset * 5.0
+
+
 def _apply_wall_attraction(
     state: CubeState,
     left_rect: tuple[int, int, int, int],
@@ -1355,6 +1376,50 @@ def _apply_wall_attraction(
         vel_x += nx * impulse
         vel_y += ny * impulse
         state.velocity = (vel_x, vel_y)
+
+
+def _apply_pong_motion(
+    state: CubeState,
+    width: int,
+    height: int,
+    half_w: float,
+    half_h: float,
+    base_speed: float,
+    min_horizontal_ratio: float = 0.55,
+    max_vertical_ratio: float = 0.72,
+) -> None:
+    if state.position is None or state.grabbed_by is not None:
+        return
+
+    pos_x, pos_y = state.position
+    vel_x, vel_y = state.velocity
+    if abs(vel_x) < 1.0 and abs(vel_y) < 1.0:
+        vel_x = base_speed if pos_x <= width * 0.5 else -base_speed
+        vel_y = 0.0
+
+    if pos_y - half_h <= 1.0 and vel_y < 0.0:
+        vel_y = abs(vel_y)
+    elif pos_y + half_h >= height - 1.0 and vel_y > 0.0:
+        vel_y = -abs(vel_y)
+
+    max_vy = base_speed * max_vertical_ratio
+    vel_y = _clamp_value(vel_y, -max_vy, max_vy)
+
+    min_vx = base_speed * min_horizontal_ratio
+    if abs(vel_x) < min_vx:
+        vel_x = min_vx if vel_x >= 0.0 else -min_vx
+
+    speed = math.hypot(vel_x, vel_y)
+    if speed > 1e-5:
+        speed_scale = base_speed / speed
+        vel_x *= speed_scale
+        vel_y *= speed_scale
+
+    vel_y = _clamp_value(vel_y, -max_vy, max_vy)
+    if abs(vel_x) < min_vx:
+        vel_x = min_vx if vel_x >= 0.0 else -min_vx
+
+    state.velocity = (vel_x, vel_y)
 
 
 def _apply_gesture_powers(
@@ -1720,8 +1785,10 @@ def main() -> None:
     )
     paddle_centers: dict[str, float | None] = {"left": None, "right": None}
     clock_state = CubeState()
-    score = 0
-    last_paddle_hit: dict[int, float] = {}  # Track last hit time per cube to avoid spam
+    scores = {"left": 0, "right": 0}
+    goal_overlap_state: dict[int, str | None] = {}
+    goal_attraction_strength = 1200.0
+    pong_speed = 540.0
     ui_flags = {
         "stats": False,
         "graphs": False,
@@ -2374,7 +2441,12 @@ def main() -> None:
                     state.pitch = -15.0 + idx * 6.0
                     state.yaw_target = state.yaw
                     state.pitch_target = state.pitch
-                    state.velocity = (0.0, 0.0)
+                    if obj.kind == "cube":
+                        horizontal = pong_speed if idx % 2 == 0 else -pong_speed
+                        vertical = -110.0 if idx % 2 == 0 else 110.0
+                        state.velocity = (horizontal, vertical)
+                    else:
+                        state.velocity = (0.0, 0.0)
 
             _apply_gesture_powers(
                 objects,
@@ -2454,7 +2526,15 @@ def main() -> None:
                 
                 # Appliquer l'attraction vers les murs pour les cubes
                 if obj.kind == "cube":
-                    _apply_wall_attraction(state, left_rect, right_rect, width, 800.0, dt)
+                    _apply_wall_attraction(
+                        state,
+                        left_rect,
+                        right_rect,
+                        width,
+                        goal_attraction_strength,
+                        dt,
+                    )
+                    _apply_pong_motion(state, width, height, half_w, half_h, pong_speed)
                 
                 radii.append(max(half_w, half_h))
                 object_states.append(state)
@@ -2462,11 +2542,14 @@ def main() -> None:
             if len(object_states) > 1:
                 _resolve_cube_collisions(object_states, radii, physics.config.restitution)
 
-            for idx, (obj, contact) in enumerate(zip(objects, contact_flags)):
+            active_goal_ids: set[int] = set()
+            for obj, contact in zip(objects, contact_flags):
                 state = obj.state
                 if state.position is None:
                     continue
                 if obj.kind == "cube":
+                    object_key = id(obj)
+                    active_goal_ids.add(object_key)
                     projected, rotated = renderer.project(
                         (int(state.position[0]), int(state.position[1])),
                         state.yaw,
@@ -2494,11 +2577,36 @@ def main() -> None:
                     hit_right = _check_paddle_collision(
                         state.position, half_w, half_h, right_rect
                     )
-                    
-                    # Éviter le spam de score (cooldown de 0.5 secondes)
-                    if (hit_left or hit_right) and (idx not in last_paddle_hit or now - last_paddle_hit[idx] > 0.5):
-                        score += 10
-                        last_paddle_hit[idx] = now
+                    if hit_left and not hit_right:
+                        _apply_paddle_bounce(state, left_rect, "left", half_w)
+                    elif hit_right and not hit_left:
+                        _apply_paddle_bounce(state, right_rect, "right", half_w)
+                    elif hit_left and hit_right:
+                        if state.position[0] <= divider_x:
+                            _apply_paddle_bounce(state, left_rect, "left", half_w)
+                        else:
+                            _apply_paddle_bounce(state, right_rect, "right", half_w)
+                    _apply_pong_motion(state, width, height, half_w, half_h, pong_speed)
+                    projected, rotated = renderer.project(
+                        (int(state.position[0]), int(state.position[1])),
+                        state.yaw,
+                        state.pitch,
+                        focal_length,
+                        state.scale,
+                    )
+                    side_color = CUBE_RED if state.position[0] > divider_x else CUBE_BLUE
+                    if hit_left and hit_right:
+                        current_zone = "left" if state.position[0] <= divider_x else "right"
+                    elif hit_left:
+                        current_zone = "left"
+                    elif hit_right:
+                        current_zone = "right"
+                    else:
+                        current_zone = None
+                    previous_zone = goal_overlap_state.get(object_key)
+                    if previous_zone is None and current_zone is not None:
+                        scores[current_zone] += 1
+                    goal_overlap_state[object_key] = current_zone
                     
                     renderer.draw(
                         frame,
@@ -2520,6 +2628,10 @@ def main() -> None:
                         _avg_scale(state.scale),
                         contact,
                     )
+
+            stale_goal_ids = [key for key in goal_overlap_state if key not in active_goal_ids]
+            for key in stale_goal_ids:
+                del goal_overlap_state[key]
 
             if objects:
                 avg_speed = sum(
@@ -2566,8 +2678,7 @@ def main() -> None:
             mask_morph_menu.draw(frame)
             _draw_top_bar(frame, menu.is_open, menu_hover)
             
-            # Afficher le score
-            score_text = f"Score: {score}"
+            score_text = f"Left: {scores['left']}   Right: {scores['right']}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.8
             thickness = 2
